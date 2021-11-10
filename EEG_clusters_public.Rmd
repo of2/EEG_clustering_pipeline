@@ -1,0 +1,2904 @@
+---
+title: "EEG-based clusters differentiate psychological distress, sleep quality and cognitive function in adolescents: R Code for multi-stage analysis pipeline"
+author: "Owen Forbes"
+date: "13/10/2021"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+
+This document presents R code for the multi-stage analysis pipeline in our paper "EEG-based clusters differentiate psychological distress, sleep quality and cognitive function in adolescents"
+
+**An approximate guide to the sections below...**
+
+* Lines 30-250: Import data (mtspectrogram output from MATLAB), extract desired frequency features
+* Lines 250-325: Standardise (center + scale) data and apply PCA, retain appropriate n. of components
+* Lines 325-1055: Apply 3 clustering methods (k-means, hierarchical clustering using Ward's method, and GMM); Test for the optimal number of clusters K to use from each method; select the optimal number of clusters for each; apply each method using optimal K and plot results
+* Lines 1055-1275: Find overlapping 'core' clusters across the 3 methods, and plot them
+* Lines 1275-1400: Calculate mean (and SD) for PSDs in each core cluster + plot them
+* Lines 1400-1550: Calculating descriptive statistics for EEG measures and health measures in each cluster
+* Lines 1550-2000: Exploratory frequentist comparisons of health + cognitive measures between clusters (only discussed briefly in paper)
+* Lines 2000-2300: Bayesian regression models to examine between-cluster differences in health and cognitive measures - commented out sections show code for sensitivity analyses to test effect of different priors, inclusion of sex as a covariate, and inclusion/exclusion of an individual with an outlying score on SIDAS scale (discussed in paper)
+* Lines 2300-2350: Generate violin plots for health and cognitive measures across clusters
+* Lines 2350-2710: Calculate posterior probabilities and expected marginal means for pairwise contrasts of clusters from brms models. Generate Figure 6 for paper - table with shaded cells showing posterior probabilities
+* Lines 2710-2915: Generate Figure 5 from paper showing z-scores (relative to global mean) in each cluster for EEG features and health/cognitive measures
+
+
+
+```{r setup, echo=T}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/Dropbox/QUT_MPhil/1-ThesisMaster/3-Tranche1-EEG/3-DataAnalysis/QUT_MPhil/Applied_paper1_coreclusters")
+
+# Packages
+library(rmatio) # 0.14.0 - for importing .mat tensor/array of matrices (spectrogram output of multitaper analysis)
+library(ForeCA) # for spectral entropy - to be run on cleaned EEG time series per channel
+library(psych) # For PCA
+library(stringr) # for string splitting 
+library(tidyverse) # for magrittr piping, ggplot, etc
+library(factoextra) # for fviz_*
+library(plotly) #for 3d plots
+library(mclust)
+library(dbscan)
+library(xtable) #for LaTeX tables
+library(gridExtra) #for arranging ggplots
+library(viridis) #for Viridis palette
+library(emmeans) #for pairwise contrasts from categorical brms
+library(brms) #for Bayesian regression models
+library(rv) #for comparing posterior probability for differences in outcomes between clusters (saving Stan draws as "random variable" objects)
+
+
+set.seed(122)
+```
+
+
+
+
+Extracting features from MT spectrogram (PER CHANNEL, averaged across session)
+
+Features:
+- Total Power
+- Fractional/relative power in 4 Hz bands from 0-16 Hz
+- IAF
+- SEF95
+- Spectral entropy
+
+Imports mtspectrogram output from MATLAB (see EEG pre-processing MATLAB file)
+
+```{r features demo, eval=FALSE}
+
+mt_spec <- read.mat('/Volumes/Owen_SSD/t1_EC/mt_1_3_cl_1_5/LAB_0199_01_8_EC_mt_1_3_cl_1_5.mat')
+
+# Create empty array structure
+# Populate with matrix slices from .mat output from MATLAB mtspectrogram
+
+# Check dimensions - maybe draw from  
+s_pow <- array(dim=c(dim(mt_spec$S)[1],dim(mt_spec$S)[2],32))
+
+for (i in 1:32){
+  s_pow[,,i] <- mt_spec$S[,,i]
+  s_pow
+}
+
+s_pow[1,2,1] # [row, column, slice]
+
+
+mt_mean_over_time <- apply(s_pow,c(2,3),mean) # take mean PSD over EEG recording session
+
+
+
+
+  
+# Try visually plotting frequency PSDs per channel, 0 to 50 Hz
+par(mfrow=c(4,8),mar=c(1,1,1,1))
+for (i in 1:32){
+  plot((mt_mean_over_time[1:513,i]))
+}
+
+# Try visually plotting frequency PSDs per channel, 0 to 50 Hz
+par(mfrow=c(4,8),mar=c(1,1,1,1))
+for (i in 1:32){
+  plot(density(mt_mean_over_time[1:100,i]))
+}
+
+# test finding location of alpha peaks on midline channels 31,32,13,16
+mt_spec$f[which.max(mt_mean_over_time[31,])]
+mt_spec$f[which.max(mt_mean_over_time[32,15:29])]
+mt_spec$f[which.max(mt_mean_over_time[,13])]
+mt_spec$f[which.max(mt_mean_over_time[,16])]
+```
+
+
+
+#---------------------------------------
+
+
+# Average multitaper results across time, extract only channels of interest (initially using midline)
+
+```{r above_as_loop}
+
+
+chan_names <- c('Fp1', 'AF3', 'F7', 'F3', 'FC1', 'FC5', 'T7', 'C3', 'CP1', 'CP5', 'P7', 'P3', 'Pz', 'PO3', 'O1', 'Oz', 'O2', 'PO4', 'P4', 'P8', 'CP6', 'CP2', 'C4', 'T8', 'FC6', 'FC2', 'F4', 'F8', 'AF4', 'Fp2', 'Fz', 'Cz')
+
+mat_files <- list.files(path="/Volumes/Owen_SSD/t1_EC/mt_1_3_cl_1_5", pattern="*.mat", full.names=TRUE, recursive=FALSE)
+
+#create storage matrix for outputs - each row will be a vector of each feature (7) at each midline electrode (4) = 28 length
+
+midline_ff_store <- matrix(NA,nrow=length(mat_files),ncol=(4*8))
+
+
+#create storage matrix for outputs - each row will be a vector of each feature (7) at each midline electrode (32) = 224 length
+all_locs_ff_store <- matrix(NA,nrow=length(mat_files),ncol=(32*8))
+  
+
+#v9 081220 create storage array for mt_mean_over_time for each participant
+# will need to be updated if importing different number of channels or MT output with different frequency resolution
+mt_mot_store <- array(NA,dim=c(32,513,length(mat_files)))
+
+# start Loop across all files in folder
+
+for (n in 1:length(mat_files)){
+  mt_spec <- read.mat(mat_files[n])
+
+  # Create empty array structure
+# Populate with matrix slices from .mat output from MATLAB mtspectrogram
+
+# Check dimensions - draw from dimensions of object
+s_pow <- array(dim=c(dim(mt_spec$S)[1],dim(mt_spec$S)[2],32))
+
+for (i in 1:32){
+  s_pow[,,i] <- mt_spec$S[,,i]
+  s_pow
+}
+
+
+
+# Average over time... For every combination of channel and frequency, take the mean across all time slices
+mt_mean_over_time <- apply(s_pow,c(2,3),mean)
+
+# transpose so channels are rows
+
+mt_mean_over_time <- t(mt_mean_over_time)
+
+
+
+  
+freq_feats_df <- data.frame('channels'=c(1:32),'chan_name'=chan_names,'peak_f'=NA,'sef_95'=NA,'tot_pow'=NA,'pow_0_4'=NA,'pow_4_8'=NA,'pow_8_12'=NA,'pow_12_16'=NA,'spectral_entropy'=NA)
+
+for (i in 1:32){
+freq_feats_df$peak_f[i] <- mt_spec$f[14+(which.max(mt_mean_over_time[i,15:29]))] # NOT DECIBEL FOR THIS #updated to look in range 7-14Hz for IAF (15:29 frequency index)
+
+freq_feats_df$sef_95[i] <- mt_spec$f[match(TRUE,(cumsum((mt_mean_over_time[i,]))/sum((mt_mean_over_time[i,])) > 0.95))] freq_feats_df$tot_pow[i] <- sum((mt_mean_over_time[i,])) 
+
+#! do below with raw frequency (not decibel)
+freq_feats_df$pow_0_4[i] <- sum(mt_mean_over_time[i,1:8])/sum(mt_mean_over_time[i,]) 
+
+
+freq_feats_df$pow_4_8[i] <- sum(mt_mean_over_time[i,9:16])/sum(mt_mean_over_time[i,])
+freq_feats_df$pow_8_12[i] <- sum(mt_mean_over_time[i,17:24])/sum(mt_mean_over_time[i,]) 
+freq_feats_df$pow_12_16[i] <- sum(mt_mean_over_time[i,25:32])/sum(mt_mean_over_time[i,])
+
+
+#v9 081220 Create NORMALISED PSD for calculating spectral entropy - dividing by sum for channel...
+# Reference for normalising - https://www.sciencedirect.com/science/article/pii/S2213158219301135
+mtmot_normalised <- t(apply(mt_mean_over_time,1,function(x) x/sum(x)))
+
+#v9 081220 adding spectral entropy 
+
+freq_feats_df$spectral_entropy <- ForeCA::spectral_entropy(mtmot_normalised[i,])[[1]]
+}
+
+#v9 081220 updated index below to 3:10 after adding spectral entropy above
+
+freq_feats_midline <- freq_feats_df[c(31,32,13,16),c(3:10)]
+#ff_midline_vec <- as.vector(as.matrix(freq_feats_midline))
+ff_midline_vec <- cbind(freq_feats_midline[1,],freq_feats_midline[2,],freq_feats_midline[3,],freq_feats_midline[4,])
+midline_ff_store[n,] <- as.vector(as.matrix(ff_midline_vec))
+
+
+
+ff_all_locs_vec <- as.vector(as.matrix(freq_feats_df[,c(3:10)])) 
+all_locs_ff_store[n,] <- ff_all_locs_vec
+
+# store mt_mean_over_time for each participant
+
+mt_mot_store[,,n] <- mt_mean_over_time
+
+}
+
+midline_ff_store <- data.frame(midline_ff_store)
+
+
+# v11 - cloning crossing() for channel x feature names including spectral entropy from l 500 below
+
+midline_names <- chan_names[c(31,32,13,16)]
+feature_names <- factor(colnames(freq_feats_df)[3:10],levels = c("peak_f","sef_95" ,   "tot_pow" ,  "pow_0_4" ,  "pow_4_8" ,  "pow_8_12",  "pow_12_16","spectral_entropy"))
+
+midline_chan_feat_combos <- tidyr::crossing(midline_names,feature_names)
+midline_chan_feat_combos <- paste(midline_chan_feat_combos$midline_names,midline_chan_feat_combos$feature_names,sep="_")
+colnames(midline_ff_store) <- midline_chan_feat_combos
+
+
+cz_ff_store_orig <- midline_ff_store[,1:8]
+
+#---------------------------------
+
+# Demo plots of PSDs
+plot(mt_mot_store[32,1:100,1],type='l',ylim=c(0,20))
+# .
+
+plot(mt_mot_store[32,1:100,15],type='l',ylim=c(0,20)) # check out this unit with a huge alpha peak
+
+plot(mt_mot_store[32,1:100,24],type='l',ylim=c(0,20)) # and this one
+
+# .
+# .
+plot(mt_mot_store[32,1:100,59],type='l',ylim=c(0,20))
+
+
+hz_list <- seq(0.5,50,0.5)
+demo_psd <- mt_mot_store[32,1:100,24]
+plot(demo_psd~hz_list,type='l',ylim=c(0,20),xlab = "Frequency (Hz)", ylab="Power (uV^2/Hz)", main="Power Spectral Density (PSD)") # and this one
+
+
+
+```
+
+
+
+
+# STANDARDISE (scale and centre) midline_ff_store before any dimensionality reduction steps
+
+```{r standardise}
+
+#sanity check midline_ff_store
+headTail(midline_ff_store)
+
+#180221 since updating psycho, "standardize()" has been deprecated - replacing with scale()
+#midline_ff_store_stdised <- psycho::standardize(midline_ff_store)
+midline_ff_store_stdised <- scale(midline_ff_store)
+headTail(midline_ff_store_stdised)
+```
+
+
+# Vertex (Cz) PCA
+```{r Cz PCA}
+
+cz_names <- "Cz"
+feature_names <- factor(colnames(freq_feats_df)[3:10],levels = c("peak_f","sef_95", "tot_pow",  "pow_0_4" ,  "pow_4_8" ,  "pow_8_12",  "pow_12_16","spectral_entropy"))
+cz_chan_feat_combos <- tidyr::crossing(cz_names,feature_names)
+
+cz_chan_feat_combos <- paste(cz_chan_feat_combos$cz_names,cz_chan_feat_combos$feature_names,sep="_")
+
+
+#cz_pca_3 <- psych::principal(cz_ff_store,nfactors=3)
+
+cz_ff_store <- midline_ff_store_stdised[,1:8] #KEEP Cz only
+names(cz_ff_store) <- cz_chan_feat_combos
+
+# scale and center as part of PCA
+cz_pca_scree <- prcomp(cz_ff_store) # 
+
+# SCREE PLOT 
+screeplot(cz_pca_scree) # CLEAR ELBOW AT 3
+
+plot(cz_pca_scree,type='l')
+     
+# Eigenvalues for scree plot
+fa_scree <- eigen(cor(cz_ff_store))
+fa_scree$values 
+
+
+cz_pca_3 <- prcomp(cz_ff_store,rank.=3) 
+summary(cz_pca_3)
+
+
+
+
+# v5 - examine contributions of features by channel to each PC
+data.frame(cbind(cz_pca_3$rotation,cz_chan_feat_combos))
+
+
+cluster_input <- cz_pca_3$x
+
+
+#v9 generate LaTeX table of PCA summary
+print(xtable(summary(cz_pca_3)),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+#Row of eigenvalues to add
+print(xtable(matrix(fa_scree$values,nr=1),digits=4),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+#v9 Latex table of PCA loadings
+
+print(xtable(cz_pca_3$rotation,digits=4),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+par(mfrow=c(1,3))
+plot(cz_pca_3$x[,1],cz_pca_3$x[,2],xlab="PC1",ylab="PC2")
+plot(cz_pca_3$x[,1],cz_pca_3$x[,3],xlab="PC1",ylab="PC3")
+plot(cz_pca_3$x[,2],cz_pca_3$x[,3],xlab="PC2",ylab="PC3")
+
+
+
+
+```
+
+### Cluster input should have the same format (matrix, no rownames) across the methods -- (3) columns from FA or PCA output
+
+# Cluster pipeline
+
+## 1. Testing optimal clusters
+
+Outputs: 
+1-5 = kmeans
+6-9 = hclust
+10-11 = GMM
+```{r optimal cluster testing}
+
+#GMM testing
+# also looking at optimal cluster numbers for GMM, kmeans and medoids
+
+# Try ClusterR::Optimal...
+# and fviz_nbclust()
+# and package NbClust::...
+
+
+print("kmeans optimal tests")
+
+ClusterR::Optimal_Clusters_KMeans(cluster_input,max_clusters=8,criterion="AIC")
+ClusterR::Optimal_Clusters_KMeans(cluster_input,max_clusters=10,criterion="BIC") #first elbow at 2, second elbow at 6
+
+fviz_nbclust(cluster_input,kmeans,method="silhouette") # 2 optimal, 5 v. similar
+fviz_nbclust(cluster_input,kmeans,method="wss") # First elbow at 2, second at 6?
+fviz_nbclust(cluster_input,kmeans,method="gap_stat") # 1 optimal, 1-5 p similar, 5 is better than 6
+
+#------
+
+print("hclust optimal tests")
+
+fviz_nbclust(cluster_input,hcut,method="silhouette") # 2 optimal, 5 v. similar
+fviz_nbclust(cluster_input,hcut,method="wss") # First elbow at 2, second at 6?
+fviz_nbclust(cluster_input,hcut,method="gap_stat") # 1 optimal, 1-5 p similar, 5 is better than 6
+
+
+
+#------
+print("GMM optimal tests")
+
+ClusterR::Optimal_Clusters_GMM(cluster_input,max_clusters=10,criterion="BIC")
+ClusterR::Optimal_Clusters_GMM(cluster_input,max_clusters=10,criterion="AIC")
+
+
+#gmm_mclust_opt <- mclust::Mclust(cluster_input)
+
+#plot(gmm_mclust_opt$BIC,  col = "black", ylab = "-BIC",xlim=c(1,10))
+
+#plot(Mclust(cluster_input))
+
+
+
+
+
+```
+
+---------------------------------------------
+
+Applied paper 1 020221
+2. Testing optimal K with Xie-Beni and Calinski-Harabasz indices
+
+
+```{r CHXB}
+
+#-----------------------------------------------
+
+# kmeans CH and XB
+
+
+
+#set.seed(122)
+set.seed(122)
+
+km_1 <- kmeans(cluster_input,centers=1)$cluster
+km_2 <- kmeans(cluster_input,centers=2)$cluster
+km_3 <- kmeans(cluster_input,centers=3)$cluster
+km_4 <- kmeans(cluster_input,centers=4)$cluster
+km_5 <- kmeans(cluster_input,centers=5)$cluster
+km_6 <- kmeans(cluster_input,centers=6)$cluster
+km_7 <- kmeans(cluster_input,centers=7)$cluster
+km_8 <- kmeans(cluster_input,centers=8)$cluster
+km_9 <- kmeans(cluster_input,centers=9)$cluster
+km_10 <- kmeans(cluster_input,centers=10)$cluster
+
+
+
+
+km_1_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_1),crit=c("Xie_Beni"))
+km_2_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_2),crit=c("Xie_Beni"))
+km_3_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_3),crit=c("Xie_Beni"))
+km_4_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_4),crit=c("Xie_Beni"))
+km_5_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_5),crit=c("Xie_Beni"))
+km_6_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_6),crit=c("Xie_Beni"))
+km_7_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_7),crit=c("Xie_Beni"))
+km_8_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_8),crit=c("Xie_Beni"))
+km_9_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_9),crit=c("Xie_Beni"))
+km_10_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_10),crit=c("Xie_Beni"))
+
+
+km_1_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_1),crit=c("Calinski_Harabasz"))
+km_2_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_2),crit=c("Calinski_Harabasz"))
+km_3_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_3),crit=c("Calinski_Harabasz"))
+km_4_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_4),crit=c("Calinski_Harabasz"))
+km_5_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_5),crit=c("Calinski_Harabasz"))
+km_6_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_6),crit=c("Calinski_Harabasz"))
+km_7_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_7),crit=c("Calinski_Harabasz"))
+km_8_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_8),crit=c("Calinski_Harabasz"))
+km_9_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_9),crit=c("Calinski_Harabasz"))
+km_10_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_10),crit=c("Calinski_Harabasz"))
+
+km_all_XB <- as.vector(c(km_1_XB[[1]],km_2_XB[[1]],km_3_XB[[1]],km_4_XB[[1]],km_5_XB[[1]],km_6_XB[[1]],km_7_XB[[1]],km_8_XB[[1]],km_9_XB[[1]],km_10_XB[[1]]))
+km_all_CH <- as.vector(c(km_1_CH[[1]],km_2_CH[[1]],km_3_CH[[1]],km_4_CH[[1]],km_5_CH[[1]],km_6_CH[[1]],km_7_CH[[1]],km_8_CH[[1]],km_9_CH[[1]],km_10_CH[[1]]))
+
+
+#050221 adding DB, silhouette, dunn for k-means
+
+
+km_1_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_1),crit=c("Davies_Bouldin"))
+km_2_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_2),crit=c("Davies_Bouldin"))
+km_3_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_3),crit=c("Davies_Bouldin"))
+km_4_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_4),crit=c("Davies_Bouldin"))
+km_5_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_5),crit=c("Davies_Bouldin"))
+km_6_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_6),crit=c("Davies_Bouldin"))
+km_7_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_7),crit=c("Davies_Bouldin"))
+km_8_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_8),crit=c("Davies_Bouldin"))
+km_9_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_9),crit=c("Davies_Bouldin"))
+km_10_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_10),crit=c("Davies_Bouldin"))
+
+km_all_DB <- as.vector(c(km_1_DB[[1]],km_2_DB[[1]],km_3_DB[[1]],km_4_DB[[1]],km_5_DB[[1]],km_6_DB[[1]],km_7_DB[[1]],km_8_DB[[1]],km_9_DB[[1]],km_10_DB[[1]]))
+
+km_1_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_1),crit=c("Silhouette"))
+km_2_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_2),crit=c("Silhouette"))
+km_3_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_3),crit=c("Silhouette"))
+km_4_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_4),crit=c("Silhouette"))
+km_5_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_5),crit=c("Silhouette"))
+km_6_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_6),crit=c("Silhouette"))
+km_7_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_7),crit=c("Silhouette"))
+km_8_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_8),crit=c("Silhouette"))
+km_9_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_9),crit=c("Silhouette"))
+km_10_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_10),crit=c("Silhouette"))
+
+km_all_silh <- as.vector(c(km_1_silh[[1]],km_2_silh[[1]],km_3_silh[[1]],km_4_silh[[1]],km_5_silh[[1]],km_6_silh[[1]],km_7_silh[[1]],km_8_silh[[1]],km_9_silh[[1]],km_10_silh[[1]]))
+
+km_1_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_1),crit=c("Dunn"))
+km_2_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_2),crit=c("Dunn"))
+km_3_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_3),crit=c("Dunn"))
+km_4_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_4),crit=c("Dunn"))
+km_5_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_5),crit=c("Dunn"))
+km_6_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_6),crit=c("Dunn"))
+km_7_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_7),crit=c("Dunn"))
+km_8_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_8),crit=c("Dunn"))
+km_9_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_9),crit=c("Dunn"))
+km_10_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(km_10),crit=c("Dunn"))
+
+km_all_dunn <- as.vector(c(km_1_dunn[[1]],km_2_dunn[[1]],km_3_dunn[[1]],km_4_dunn[[1]],km_5_dunn[[1]],km_6_dunn[[1]],km_7_dunn[[1]],km_8_dunn[[1]],km_9_dunn[[1]],km_10_dunn[[1]]))
+
+
+
+#-------------------------------------------
+
+#hclust(ward) CH and XB
+
+hc_tocut <- hclust(dist(cluster_input),method="ward.D2") # ward.D2 minimises increase in variance explained at each agglomeration step
+
+hc_1 <- cutree(hc_tocut,k=1)
+hc_2 <- cutree(hc_tocut,k=2)
+hc_3 <- cutree(hc_tocut,k=3)
+hc_4 <- cutree(hc_tocut,k=4)
+hc_5 <- cutree(hc_tocut,k=5)
+hc_6 <- cutree(hc_tocut,k=6)
+hc_7 <- cutree(hc_tocut,k=7)
+hc_8 <- cutree(hc_tocut,k=8)
+hc_9 <- cutree(hc_tocut,k=9)
+hc_10 <- cutree(hc_tocut,k=10)
+
+
+hc_1_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_1),crit=c("Xie_Beni"))
+hc_2_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_2),crit=c("Xie_Beni"))
+hc_3_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_3),crit=c("Xie_Beni"))
+hc_4_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_4),crit=c("Xie_Beni"))
+hc_5_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_5),crit=c("Xie_Beni"))
+hc_6_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_6),crit=c("Xie_Beni"))
+hc_7_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_7),crit=c("Xie_Beni"))
+hc_8_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_8),crit=c("Xie_Beni"))
+hc_9_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_9),crit=c("Xie_Beni"))
+hc_10_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_10),crit=c("Xie_Beni"))
+
+
+hc_1_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_1),crit=c("Calinski_Harabasz"))
+hc_2_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_2),crit=c("Calinski_Harabasz"))
+hc_3_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_3),crit=c("Calinski_Harabasz"))
+hc_4_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_4),crit=c("Calinski_Harabasz"))
+hc_5_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_5),crit=c("Calinski_Harabasz"))
+hc_6_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_6),crit=c("Calinski_Harabasz"))
+hc_7_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_7),crit=c("Calinski_Harabasz"))
+hc_8_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_8),crit=c("Calinski_Harabasz"))
+hc_9_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_9),crit=c("Calinski_Harabasz"))
+hc_10_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_10),crit=c("Calinski_Harabasz"))
+
+hc_all_XB <- as.vector(c(hc_1_XB[[1]],hc_2_XB[[1]],hc_3_XB[[1]],hc_4_XB[[1]],hc_5_XB[[1]],hc_6_XB[[1]],hc_7_XB[[1]],hc_8_XB[[1]],hc_9_XB[[1]],hc_10_XB[[1]]))
+hc_all_CH <- as.vector(c(hc_1_CH[[1]],hc_2_CH[[1]],hc_3_CH[[1]],hc_4_CH[[1]],hc_5_CH[[1]],hc_6_CH[[1]],hc_7_CH[[1]],hc_8_CH[[1]],hc_9_CH[[1]],hc_10_CH[[1]]))
+
+# 050221 Adding DB, silhouette, Dunn
+
+hc_1_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_1),crit=c("Davies_Bouldin"))
+hc_2_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_2),crit=c("Davies_Bouldin"))
+hc_3_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_3),crit=c("Davies_Bouldin"))
+hc_4_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_4),crit=c("Davies_Bouldin"))
+hc_5_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_5),crit=c("Davies_Bouldin"))
+hc_6_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_6),crit=c("Davies_Bouldin"))
+hc_7_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_7),crit=c("Davies_Bouldin"))
+hc_8_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_8),crit=c("Davies_Bouldin"))
+hc_9_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_9),crit=c("Davies_Bouldin"))
+hc_10_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_10),crit=c("Davies_Bouldin"))
+
+hc_all_DB <- as.vector(c(hc_1_DB[[1]],hc_2_DB[[1]],hc_3_DB[[1]],hc_4_DB[[1]],hc_5_DB[[1]],hc_6_DB[[1]],hc_7_DB[[1]],hc_8_DB[[1]],hc_9_DB[[1]],hc_10_DB[[1]]))
+
+hc_1_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_1),crit=c("Silhouette"))
+hc_2_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_2),crit=c("Silhouette"))
+hc_3_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_3),crit=c("Silhouette"))
+hc_4_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_4),crit=c("Silhouette"))
+hc_5_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_5),crit=c("Silhouette"))
+hc_6_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_6),crit=c("Silhouette"))
+hc_7_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_7),crit=c("Silhouette"))
+hc_8_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_8),crit=c("Silhouette"))
+hc_9_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_9),crit=c("Silhouette"))
+hc_10_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_10),crit=c("Silhouette"))
+
+hc_all_silh <- as.vector(c(hc_1_silh[[1]],hc_2_silh[[1]],hc_3_silh[[1]],hc_4_silh[[1]],hc_5_silh[[1]],hc_6_silh[[1]],hc_7_silh[[1]],hc_8_silh[[1]],hc_9_silh[[1]],hc_10_silh[[1]]))
+
+hc_1_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_1),crit=c("Dunn"))
+hc_2_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_2),crit=c("Dunn"))
+hc_3_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_3),crit=c("Dunn"))
+hc_4_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_4),crit=c("Dunn"))
+hc_5_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_5),crit=c("Dunn"))
+hc_6_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_6),crit=c("Dunn"))
+hc_7_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_7),crit=c("Dunn"))
+hc_8_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_8),crit=c("Dunn"))
+hc_9_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_9),crit=c("Dunn"))
+hc_10_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(hc_10),crit=c("Dunn"))
+
+hc_all_dunn <- as.vector(c(hc_1_dunn[[1]],hc_2_dunn[[1]],hc_3_dunn[[1]],hc_4_dunn[[1]],hc_5_dunn[[1]],hc_6_dunn[[1]],hc_7_dunn[[1]],hc_8_dunn[[1]],hc_9_dunn[[1]],hc_10_dunn[[1]]))
+
+
+
+
+
+#-------------------------------------------
+
+
+# GMM CH and XB
+
+gmm_1 <- ClusterR::GMM(cluster_input,1)
+gmm_2 <- ClusterR::GMM(cluster_input,2)
+gmm_3 <- ClusterR::GMM(cluster_input,3)
+gmm_4 <- ClusterR::GMM(cluster_input,4)
+gmm_5 <- ClusterR::GMM(cluster_input,5)
+gmm_6 <- ClusterR::GMM(cluster_input,6)
+gmm_7 <- ClusterR::GMM(cluster_input,7)
+gmm_8 <- ClusterR::GMM(cluster_input,8)
+gmm_9 <- ClusterR::GMM(cluster_input,9)
+gmm_10 <- ClusterR::GMM(cluster_input,10)
+
+gmm_1_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_1$centroids,COVARIANCE = gmm_1$covariance_matrices,WEIGHTS=gmm_1$weights)
+gmm_2_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_2$centroids,COVARIANCE = gmm_2$covariance_matrices,WEIGHTS=gmm_2$weights)
+gmm_3_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_3$centroids,COVARIANCE = gmm_3$covariance_matrices,WEIGHTS=gmm_3$weights)
+gmm_4_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_4$centroids,COVARIANCE = gmm_4$covariance_matrices,WEIGHTS=gmm_4$weights)
+gmm_5_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_5$centroids,COVARIANCE = gmm_5$covariance_matrices,WEIGHTS=gmm_5$weights)
+gmm_6_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_6$centroids,COVARIANCE = gmm_6$covariance_matrices,WEIGHTS=gmm_6$weights)
+gmm_7_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_7$centroids,COVARIANCE = gmm_7$covariance_matrices,WEIGHTS=gmm_7$weights)
+gmm_8_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_8$centroids,COVARIANCE = gmm_8$covariance_matrices,WEIGHTS=gmm_8$weights)
+gmm_9_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_9$centroids,COVARIANCE = gmm_9$covariance_matrices,WEIGHTS=gmm_9$weights)
+gmm_10_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_10$centroids,COVARIANCE = gmm_10$covariance_matrices,WEIGHTS=gmm_10$weights)
+
+gmm_1_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_1_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_2_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_2_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_3_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_3_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_4_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_4_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_5_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_5_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_6_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_6_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_7_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_7_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_8_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_8_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_9_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_9_labs$cluster_labels),crit=c("Xie_Beni"))
+gmm_10_XB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_10_labs$cluster_labels),crit=c("Xie_Beni"))
+
+
+gmm_1_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_1_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_2_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_2_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_3_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_3_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_4_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_4_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_5_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_5_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_6_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_6_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_7_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_7_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_8_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_8_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_9_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_9_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+gmm_10_CH <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_10_labs$cluster_labels),crit=c("Calinski_Harabasz"))
+
+gmm_all_XB <- as.vector(c(gmm_1_XB[[1]],gmm_2_XB[[1]],gmm_3_XB[[1]],gmm_4_XB[[1]],gmm_5_XB[[1]],gmm_6_XB[[1]],gmm_7_XB[[1]],gmm_8_XB[[1]],gmm_9_XB[[1]],gmm_10_XB[[1]]))
+gmm_all_CH <- as.vector(c(gmm_1_CH[[1]],gmm_2_CH[[1]],gmm_3_CH[[1]],gmm_4_CH[[1]],gmm_5_CH[[1]],gmm_6_CH[[1]],gmm_7_CH[[1]],gmm_8_CH[[1]],gmm_9_CH[[1]],gmm_10_CH[[1]]))
+
+
+
+
+
+# 050221 Adding DB, silhouette, Dunn for GMM
+
+# DB
+gmm_1_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_1_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_2_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_2_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_3_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_3_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_4_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_4_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_5_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_5_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_6_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_6_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_7_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_7_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_8_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_8_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_9_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_9_labs$cluster_labels),crit=c("Davies_Bouldin"))
+gmm_10_DB <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_10_labs$cluster_labels),crit=c("Davies_Bouldin"))
+
+
+gmm_all_DB <- as.vector(c(gmm_1_DB[[1]],gmm_2_DB[[1]],gmm_3_DB[[1]],gmm_4_DB[[1]],gmm_5_DB[[1]],gmm_6_DB[[1]],gmm_7_DB[[1]],gmm_8_DB[[1]],gmm_9_DB[[1]],gmm_10_DB[[1]]))
+
+
+
+
+#Silhouette
+gmm_1_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_1_labs$cluster_labels),crit=c("Silhouette"))
+gmm_2_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_2_labs$cluster_labels),crit=c("Silhouette"))
+gmm_3_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_3_labs$cluster_labels),crit=c("Silhouette"))
+gmm_4_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_4_labs$cluster_labels),crit=c("Silhouette"))
+gmm_5_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_5_labs$cluster_labels),crit=c("Silhouette"))
+gmm_6_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_6_labs$cluster_labels),crit=c("Silhouette"))
+gmm_7_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_7_labs$cluster_labels),crit=c("Silhouette"))
+gmm_8_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_8_labs$cluster_labels),crit=c("Silhouette"))
+gmm_9_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_9_labs$cluster_labels),crit=c("Silhouette"))
+gmm_10_silh <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_10_labs$cluster_labels),crit=c("Silhouette"))
+
+
+gmm_all_silh <- as.vector(c(gmm_1_silh[[1]],gmm_2_silh[[1]],gmm_3_silh[[1]],gmm_4_silh[[1]],gmm_5_silh[[1]],gmm_6_silh[[1]],gmm_7_silh[[1]],gmm_8_silh[[1]],gmm_9_silh[[1]],gmm_10_silh[[1]]))
+
+# This implementation of the Silhouette index is not defined for clustering solutions with cluster size of 1... could replace all silhouettes with another package
+
+
+# Dunn
+gmm_1_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_1_labs$cluster_labels),crit=c("Dunn"))
+gmm_2_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_2_labs$cluster_labels),crit=c("Dunn"))
+gmm_3_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_3_labs$cluster_labels),crit=c("Dunn"))
+gmm_4_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_4_labs$cluster_labels),crit=c("Dunn"))
+gmm_5_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_5_labs$cluster_labels),crit=c("Dunn"))
+gmm_6_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_6_labs$cluster_labels),crit=c("Dunn"))
+gmm_7_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_7_labs$cluster_labels),crit=c("Dunn"))
+gmm_8_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_8_labs$cluster_labels),crit=c("Dunn"))
+gmm_9_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_9_labs$cluster_labels),crit=c("Dunn"))
+gmm_10_dunn <- clusterCrit::intCriteria(traj=cluster_input,part=as.integer(gmm_10_labs$cluster_labels),crit=c("Dunn"))
+
+
+gmm_all_dunn <- as.vector(c(gmm_1_dunn[[1]],gmm_2_dunn[[1]],gmm_3_dunn[[1]],gmm_4_dunn[[1]],gmm_5_dunn[[1]],gmm_6_dunn[[1]],gmm_7_dunn[[1]],gmm_8_dunn[[1]],gmm_9_dunn[[1]],gmm_10_dunn[[1]]))
+
+
+
+
+
+
+
+
+
+#180221 saving output to png
+
+
+png("optimal_k_plots.png",width=1400,height=800,pointsize=14)
+par(mfrow=c(3,5))
+#k-means plots
+
+
+
+plot(x=2:10,y=km_all_XB[2:10],ylab="Xie-Beni index",type="b",main="k-means optimal K \n Xie-Beni index")
+
+plot(x=2:10,y=km_all_CH[2:10],ylab="Calinski-Harabasz index",type="b",main="k-means optimal K \n Calinski-Harabasz index")
+
+plot(x=2:10,y=km_all_DB[2:10],ylab="Davies Bouldin index",type="b",main="k-means optimal K \n Davies-Bouldin index")
+  
+plot(x=2:10,y=km_all_silh[2:10],ylab="Silhouette index",type="b",main="k-means optimal K \n Silhouette index")
+
+plot(x=2:10,y=km_all_dunn[2:10],ylab="Dunn",type="b",main="k-means optimal K \n Dunn index")
+
+
+#HC plots
+plot(x=2:10,y=hc_all_XB[2:10],ylab="Xie-Beni index",type="b",main="Hierarchical clustering (Ward) optimal K \n Xie-Beni index")
+
+plot(x=2:10,y=hc_all_CH[2:10],ylab="Calinski-Harabasz index",type="b",main="Hierarchical clustering (Ward) optimal K \n Calinski-Harabasz index")
+
+plot(x=2:10,y=hc_all_DB[2:10],ylab="Davies Bouldin index",type="b",main="Hierarchical clustering (Ward) optimal K \n Davies-Bouldin index")
+  
+plot(x=2:10,y=hc_all_silh[2:10],ylab="Silhouette index",type="b",main="Hierarchical clustering (Ward) optimal K \n Silhouette index")
+
+plot(x=2:10,y=hc_all_dunn[2:10],ylab="Dunn",type="b",main="Hierarchical clustering (Ward) optimal K \n Dunn index")
+
+
+
+#GMM plots
+plot(x=2:10,y=gmm_all_XB[2:10],ylab="Xie-Beni index",type="b",main="GMM optimal K \n Xie-Beni index")
+
+plot(x=2:10,y=gmm_all_CH[2:10],ylab="Calinski-Harabasz index",type="b",main="GMM optimal K \n Calinski-Harabasz index")
+
+plot(x=2:10,y=gmm_all_DB[2:10],ylab="Davies_Bouldin index",type="b",main="GMM optimal K \n Davies_Bouldin index")
+
+plot(x=2:10,y=gmm_all_silh[2:10],ylab="Silhouette index",type="b",main="GMM optimal K \n Silhouette index")
+
+plot(x=2:10,y=gmm_all_dunn[2:10],ylab="Dunn index",type="b",main="GMM optimal K \n Dunn index")
+
+
+#180221 closing png
+dev.off()
+
+par(mfrow=c(1,1))
+
+#180221 testing NbClust - indicates 7 for HC with ward d2, and 3 for kmeans
+
+library(NbClust)
+
+
+#NbClust(cluster_input,method="ward.D",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="ward.D2",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="single",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="kmeans",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="complete",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="average",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="median",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="centroid",max.nc=10,index="alllong")
+#NbClust(cluster_input,method="mcquitty",max.nc=10,index="alllong")
+
+
+```
+
+
+
+
+
+
+---------------------------------------------
+
+### USER INPUT HERE::
+
+What is the optimal number of clusters for each method?
+
+
+```{r optimal clusters}
+
+chosen_method = "cz_pca" #mid_PCA, mid_FA, cz_PCA, cz_FA #IGNORE - legacy code
+
+
+opt_km <- 5
+
+opt_hc <- 5
+  
+opt_gmm <- 5
+
+
+```
+
+
+
+#kmeans
+```{r kmeans}
+
+set.seed(122)
+km_opt <- kmeans(cluster_input,centers=opt_km)
+
+
+table(km_opt$cluster)
+
+#160321 ordered cluster groups by size
+ordered_table_km <- sort(table(km_opt$cluster),decreasing=T)
+ordered_labels_km <- as.numeric(names(sort(table(km_opt$cluster),decreasing=T)))
+
+
+#print(xtable(table(km_opt$cluster),digits=2,nr=1),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+
+
+
+
+
+# testing 3d plot
+
+
+coloured_points_k = data.frame(seq(1,length(cluster_input[,1])))
+coloured_points_k$PC1 <- cluster_input[,1]
+coloured_points_k$PC2 <- cluster_input[,2]                          
+coloured_points_k$PC3 <- cluster_input[,3]
+coloured_points_k$clusters <- km_opt$cluster
+
+
+# 160321 ordering cluster labels by size
+coloured_points_k$clusters_ordered <- rep(NA,length(coloured_points_k$clusters))
+coloured_points_k$clusters_ordered[coloured_points_k$clusters==ordered_labels_km[[1]]] <- 1
+coloured_points_k$clusters_ordered[coloured_points_k$clusters==ordered_labels_km[[2]]] <- 2
+coloured_points_k$clusters_ordered[coloured_points_k$clusters==ordered_labels_km[[3]]] <- 3
+coloured_points_k$clusters_ordered[coloured_points_k$clusters==ordered_labels_km[[4]]] <- 4
+coloured_points_k$clusters_ordered[coloured_points_k$clusters==ordered_labels_km[[5]]] <- 5
+
+
+coloured_points_k$id <- stringr::str_sub(mat_files,start=39,end=46)
+
+
+#300321 removed scale/legend 
+plot_3d_km <- plot_ly(data=coloured_points_k,x=coloured_points_k$PC1,y=coloured_points_k$PC2,z=coloured_points_k$PC3,type="scatter3d",color=factor(coloured_points_k$clusters_ordered),colors = viridis_pal(option = "D")(5)) 
+
+plot_3d_km <- plot_3d_km %>% layout(
+  title=sprintf("k-means, K = %d",opt_km,chosen_method),
+        scene = list(camera=list(eye=list(x=-0.2,y=-1.2,z=1.75)),
+      xaxis = list(title = "PC 1"),#,range = c(-2.5,2.5)),
+      yaxis = list(title = "PC 2"),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "PC 3")#range = c(-2.5,2.5))
+    )) #%>% hide_colorbar()
+
+plot_3d_km
+
+
+#240321 save html widget for slides
+
+#htmlwidgets::saveWidget(plot_3d_km,file="plot_3d_km.html")
+
+# 2d scatterplots of clusters 160321
+
+
+plot_2d_1v2_km <- ggplot(data=coloured_points_k,aes(x=coloured_points_k$PC1,y=coloured_points_k$PC2)) + geom_point(size=5,aes(color=as.factor(coloured_points_k$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="k-means") + xlab("PC1")+ ylab("PC2")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_1v2_km
+
+plot_2d_1v3_km <- ggplot(data=coloured_points_k,aes(x=coloured_points_k$PC1,y=coloured_points_k$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_k$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="k-means") + xlab("PC1")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_1v3_km
+
+plot_2d_2v3_km <- ggplot(data=coloured_points_k,aes(x=coloured_points_k$PC2,y=coloured_points_k$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_k$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="k-means") + xlab("PC2")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_2v3_km
+
+
+```
+
+#hclust
+#050221 testing DIANA instead of Ward_D2
+```{r hclust}
+
+
+# @@@ for hclust - try testing diff agglomeration methods (method = XXXX)
+
+#Check commented out lines for DIANA vs Ward output
+
+#hclust_opt_default<- hclust(dist(cluster_input))
+#plot(hclust_opt_default)
+
+
+hclust_opt_wardD2<- hclust(dist(cluster_input),method="ward.D2") # ward.D2 minimises increase in variance explained at each agglomeration step
+plot(hclust_opt_wardD2)
+
+#cluster_diana <- cluster::diana(dist(cluster_input),diss=T)
+#plot(cluster_diana)
+
+hclust_opt_wardD2_groups <- cutree(hclust_opt_wardD2,k=opt_hc)
+
+#hc7lust_opt_wardD2_groups <- cutree(hclust_opt_wardD2,k=7)
+#table(hc7lust_opt_wardD2_groups)
+
+#hclust_diana_groups <- cutree(cluster_diana,k=opt_hc)
+
+table(hclust_opt_wardD2_groups)
+#table(hclust_diana_groups)
+
+
+#160321 ordered cluster groups by size
+
+ordered_table_hc <- sort(table(hclust_opt_wardD2_groups),decreasing=T)
+ordered_labels_hc <- as.numeric(names(sort(table(hclust_opt_wardD2_groups),decreasing=T)))
+
+
+#print(xtable(ordered_table_hc,digits=2,nr=1),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+
+
+# testing 3d plot
+coloured_points_h = data.frame(seq(1,length(cluster_input[,1])))
+coloured_points_h$PC1 <- cluster_input[,1]
+coloured_points_h$PC2 <- cluster_input[,2]                          
+coloured_points_h$PC3 <- cluster_input[,3]
+coloured_points_h$clusters <- hclust_opt_wardD2_groups
+
+#coloured_points_h$clusters <- hclust_opt_wardD2_groups
+#coloured_points_h$clusters <- hclust_diana_groups
+
+
+# 160321 ordering cluster labels by size
+coloured_points_h$clusters_ordered <- rep(NA,length(coloured_points_h$clusters))
+coloured_points_h$clusters_ordered[coloured_points_h$clusters==ordered_labels_hc[[1]]] <- 1
+coloured_points_h$clusters_ordered[coloured_points_h$clusters==ordered_labels_hc[[2]]] <- 2 #@@@@@@@@@@@@@@@@@@@@@@!!!!!!!!!!!!!
+coloured_points_h$clusters_ordered[coloured_points_h$clusters==ordered_labels_hc[[3]]] <- 4 #@@@@!!!!!!! NB 3 and 4 switched here for consistent colouring
+coloured_points_h$clusters_ordered[coloured_points_h$clusters==ordered_labels_hc[[4]]] <- 3 #@@@@@@@@@@@@@@@@@@@@@@!!!!!!!!!!!!!
+coloured_points_h$clusters_ordered[coloured_points_h$clusters==ordered_labels_hc[[5]]] <- 5
+
+#150421 testing factor color scale for discrete key/legend
+coloured_points_h$clusters_ordered <- factor(coloured_points_h$clusters_ordered)
+
+coloured_points_h$id <- stringr::str_sub(mat_files,start=39,end=46)
+
+
+plot_3d_hc <- plot_ly(data=coloured_points_h,x=coloured_points_h$PC1,y=coloured_points_h$PC2,z=coloured_points_h$PC3,type="scatter3d",color=factor(coloured_points_h$clusters_ordered),colors = viridis_pal(option = "D")(5))
+
+plot_3d_hc <- plot_3d_hc %>% layout(
+  title=sprintf("Hierarchical clustering (Ward), K = %d",opt_hc,chosen_method),
+        scene = list(camera=list(eye=list(x=-0.2,y=-1.2,z=1.75)),
+      xaxis = list(title = "PC 1"),#,range = c(-2.5,2.5)),
+      yaxis = list(title = "PC 2"),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "PC 3")#,range = c(-2.5,2.5))
+    )) #%>% hide_colorbar() 
+
+plot_3d_hc
+
+
+#240321 save html widget for slides
+
+#htmlwidgets::saveWidget(plot_3d_hc,file="plot_3d_hc_colourfix.html")
+
+
+# 2d scatterplots of clusters 160321
+
+
+plot_2d_1v2_hc <- ggplot(data=coloured_points_h,aes(x=coloured_points_h$PC1,y=coloured_points_h$PC2)) + geom_point(size=5,aes(color=as.factor(coloured_points_h$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="HC") + xlab("PC1")+ ylab("PC2")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_1v2_hc
+
+plot_2d_1v3_hc <- ggplot(data=coloured_points_h,aes(x=coloured_points_h$PC1,y=coloured_points_h$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_h$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="HC") + xlab("PC1")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_1v3_hc
+
+plot_2d_2v3_hc <- ggplot(data=coloured_points_h,aes(x=coloured_points_h$PC2,y=coloured_points_h$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_h$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="HC") + xlab("PC2")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_2v3_hc
+
+```
+
+#GMM
+```{r GMM}
+
+gmm_opt <- ClusterR::GMM(cluster_input,gaussian_comps=opt_gmm,dist_mode="eucl_dist")
+
+gmm_labs <- ClusterR::predict_GMM(cluster_input,CENTROIDS=gmm_opt$centroids,COVARIANCE = gmm_opt$covariance_matrices,WEIGHTS=gmm_opt$weights)
+
+table(gmm_labs$cluster_labels)
+
+
+#160321 ordered cluster groups by size
+
+ordered_table_gm <- sort(table(gmm_labs$cluster_labels),decreasing=T)
+ordered_labels_gm <- as.numeric(names(sort(table(gmm_labs$cluster_labels),decreasing=T)))
+
+
+
+gmm_mclust_opt <- mclust::Mclust(cluster_input)
+
+plot(-gmm_mclust_opt$BIC,  col = "black", ylab = "-BIC",xlim=c(1,10))
+
+# testing 3d plot
+coloured_points_g = data.frame(seq(1,length(cluster_input[,1])))
+coloured_points_g$PC1 <- cluster_input[,1]
+coloured_points_g$PC2 <- cluster_input[,2]                          
+coloured_points_g$PC3 <- cluster_input[,3]
+coloured_points_g$clusters <- gmm_labs$cluster_labels
+
+coloured_points_g$id <- stringr::str_sub(mat_files,start=39,end=46)
+
+
+# 160321 ordering cluster labels by size
+coloured_points_g$clusters_ordered <- rep(NA,length(coloured_points_g$clusters))
+coloured_points_g$clusters_ordered[coloured_points_g$clusters==ordered_labels_gm[[1]]] <- 1
+coloured_points_g$clusters_ordered[coloured_points_g$clusters==ordered_labels_gm[[2]]] <- 2
+coloured_points_g$clusters_ordered[coloured_points_g$clusters==ordered_labels_gm[[3]]] <- 3
+coloured_points_g$clusters_ordered[coloured_points_g$clusters==ordered_labels_gm[[4]]] <- 4
+coloured_points_g$clusters_ordered[coloured_points_g$clusters==ordered_labels_gm[[5]]] <- 5
+
+
+# 300321 added hide_colorbar() to remove legend/color scale
+
+plot_3d_gmm <- plot_ly(data=coloured_points_g,x=coloured_points_g$PC1,y=coloured_points_g$PC2,z=coloured_points_g$PC3,type="scatter3d",color=factor(coloured_points_g$clusters_ordered),colors = viridis_pal(option = "D")(5))
+
+plot_3d_gmm <- plot_3d_gmm %>% layout(
+  title=sprintf("Gaussian mixture model, K = %d",opt_gmm,chosen_method),
+        scene = list(camera=list(eye=list(x=-0.2,y=-1.2,z=1.75)),
+      xaxis = list(title = "PC 1"),#,range = c(-2.5,2.5)),
+      yaxis = list(title = "PC 2"),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "PC 3")#,range = c(-2.5,2.5))
+    ))  #%>% hide_colorbar() 
+
+plot_3d_gmm
+
+
+#240321 save html widget for slides
+
+#htmlwidgets::saveWidget(plot_3d_gmm,file="plot_3d_gmm.html")
+
+
+
+# 2d scatterplots of clusters 160321
+
+
+plot_2d_1v2_gmm <- ggplot(data=coloured_points_g,aes(x=coloured_points_g$PC1,y=coloured_points_g$PC2)) + geom_point(size=5,aes(color=as.factor(coloured_points_g$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="GMM") + xlab("PC1")+ ylab("PC2")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_1v2_gmm
+
+plot_2d_1v3_gmm <- ggplot(data=coloured_points_g,aes(x=coloured_points_g$PC1,y=coloured_points_g$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_g$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="GMM") + xlab("PC1")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_1v3_gmm
+
+plot_2d_2v3_gmm <- ggplot(data=coloured_points_g,aes(x=coloured_points_g$PC2,y=coloured_points_g$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_g$clusters_ordered))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="GMM") + xlab("PC2")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)+ theme(text = element_text(size = 18))
+plot_2d_2v3_gmm
+
+
+# All plots 3x3 160321
+png("2dplots_clusters.png",width=1500,height=1500,pointsize=18)
+grid.arrange(plot_2d_1v2_km,plot_2d_1v2_hc,plot_2d_1v2_gmm,plot_2d_1v3_km,plot_2d_1v3_hc,plot_2d_1v3_gmm,plot_2d_2v3_km,plot_2d_2v3_hc,plot_2d_2v3_gmm,nrow=3, ncol=3)
+dev.off()
+
+
+# CHANGING ARRANGEMENT OF 2D PLOTS
+
+png("2dplots_clusters_010921.png",width=1500,height=1500,pointsize=32)
+grid.arrange(plot_2d_1v2_km,plot_2d_1v3_km,plot_2d_2v3_km,plot_2d_1v2_hc,plot_2d_1v3_hc,plot_2d_2v3_hc,plot_2d_1v2_gmm,plot_2d_1v3_gmm,plot_2d_2v3_gmm,nrow=3, ncol=3)
+dev.off()
+
+```
+
+3d plots side by side
+```{r}
+plot_3d_km
+plot_3d_hc
+plot_3d_gmm
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+Identifying stable core clusters...
+
+
+- call them core groups if they co-occur in all 3 results
+- combinations of membership across HC and KM, then that combo and GMM
+- intersection in those combinations
+- keep the 'core' overlapping groups with the most intersections
+
+
+
+
+
+```{r}
+
+
+table(coloured_points_k$clusters_ordered)
+km_g1 <- which(coloured_points_k$clusters_ordered==1)
+km_g2 <- which(coloured_points_k$clusters_ordered==2)
+km_g3 <- which(coloured_points_k$clusters_ordered==3)
+km_g4 <- which(coloured_points_k$clusters_ordered==4)
+km_g5 <- which(coloured_points_k$clusters_ordered==5)
+
+
+km_glist <- list(km_g1=km_g1,km_g2=km_g2,km_g3=km_g3,km_g4=km_g4,km_g5=km_g5)
+
+
+table(coloured_points_h$clusters_ordered)
+hc_g1 <- which(coloured_points_h$clusters_ordered==1)
+hc_g2 <- which(coloured_points_h$clusters_ordered==2)
+hc_g3 <- which(coloured_points_h$clusters_ordered==3)
+hc_g4 <- which(coloured_points_h$clusters_ordered==4)
+hc_g5 <- which(coloured_points_h$clusters_ordered==5)
+
+hc_glist <- list(hc_g1=hc_g1,hc_g2=hc_g2,hc_g3=hc_g3,hc_g4=hc_g4,hc_g5=hc_g5)
+
+
+
+table(coloured_points_g$clusters_ordered)
+gmm_g1 <- which(coloured_points_g$clusters_ordered==1)
+gmm_g2 <- which(coloured_points_g$clusters_ordered==2)
+gmm_g3 <- which(coloured_points_g$clusters_ordered==3)
+gmm_g4 <- which(coloured_points_g$clusters_ordered==4)
+gmm_g5 <- which(coloured_points_g$clusters_ordered==5)
+gmm_glist <- list(gmm_g1=gmm_g1,gmm_g2=gmm_g2,gmm_g3=gmm_g3,gmm_g4=gmm_g4,gmm_g5=gmm_g5)
+
+
+
+
+#---------
+
+
+#https://stackoverflow.com/questions/24614391/intersect-all-possible-combinations-of-list-elements
+
+# find intersections of clusters between kmeans and hclust
+
+
+# find intersections of km/hc intersections, and gmm clusters
+
+
+all_append <- append(append(km_glist,hc_glist),gmm_glist)
+
+
+  
+all_nms <- combn( names(all_append) , 3 , FUN = paste0 , collapse = "" , simplify = FALSE )
+all_ll <- combn( all_append , 3 , simplify = FALSE )
+#all_out_length <- lapply( all_ll , function(x) length( intersect( x[[1]] , x[[2]] ) ) ) #050221 testing 3-way intersect
+all_out_length <- lapply( all_ll , function(x) length(intersect(intersect( x[[1]] , x[[2]] ),x[[3]]) ))
+all_out_length <- setNames( all_out_length , all_nms )
+ordered_intersect_length_all <- all_out_length[order(unlist(all_out_length),decreasing=TRUE)]
+ordered_intersect_length_all 
+
+all_out <- lapply( all_ll , function(x) intersect(intersect( x[[1]] , x[[2]] ),x[[3]]) ) # 050221 intersecting members of all 3
+all_out <- setNames( all_out , all_nms )
+all_out_ordered <- all_out[order(unlist(all_out_length),decreasing=TRUE)] #list of intersecting group members, ordered by # of intersects
+all_out_ordered[1:15]
+
+
+
+#050221 - keep groups with UNIQUE COMBINATIONS of clusters across methods (each cluster from each method represented max 1 time)
+
+
+
+total_grouped <- sum(unlist(ordered_intersect_length_all[c(1:4,7)])) #[c(1,2,3,4,6,9)])) 
+total_grouped
+
+#Core cluster labels from intersections
+
+core_cluster_labels <- all_out_ordered[c(1:4,7)]#[c(1,2,3,4,6,9)]
+
+core_cluster_colours <- rep("X",59)
+
+#120221 change below to for (j in 1:6){ for hc k=7 solution
+for (j in 1:5){   #for (j in 1:5){
+  for(i in 1:59){
+    core_cluster_colours[i] <- ifelse(i %in% core_cluster_labels[[j]],j,core_cluster_colours[i])
+  }
+}
+
+
+core_cluster_colours_factor <- factor(core_cluster_colours)
+
+#(unnecessary attempt to list colours... trying to provide list of RGBs to match to factor levels)
+core_cluster_colours_rgba <- factor(core_cluster_colours)
+core_cluster_colours_rgba <- plyr::revalue(core_cluster_colours_rgba, c("1" = "rgba(21,63,161,1)",
+                             "2" = "rgba(181,52,155,1)",
+                             "3" = "rgba(255,75,110,1)",
+                             "4" = "rgba(255,152,53,1)",
+                             "5" = "rgba(240,233,38,1)",
+                             "X" = "rgba(0,0,0,0.5)"))
+
+core_cluster_colours_rgba <- as.vector(core_cluster_colours_rgba)
+
+#core_cluster_colours_rgb_vector <- c("rgba(21,63,161,1)","rgba(181,52,155,1)","rgba(255,75,110,1)","rgba(255,152,53,1)","rgba(240,233,38,1)","rgba(204,204,204,0.5)")
+
+
+# trying hex instead of rgba
+
+
+core_cluster_colours_hex_vector <- c('ff153fa1','ff4a539f','ff68699d','ff807f9a','ff969696','80000000')
+#153fa1
+#4a539f
+#68699d
+#807f9a
+#969696
+
+# old version with uncontrolled colours for non-assigned X
+# plot_3d_core <- plot_ly(data=coloured_points_g,x=coloured_points_g$PC1,y=coloured_points_g$PC2,z=coloured_points_g$PC3,type="scatter3d",color=core_cluster_colours)
+
+plot_3d_core <- plot_ly(data=coloured_points_g,x=coloured_points_g$PC1,y=coloured_points_g$PC2,z=coloured_points_g$PC3,type="scatter3d", color=core_cluster_colours,colors = viridis_pal(option = "D")(5))#, color=core_cluster_colours_factor) #,colors=core_cluster_colours_hex_vector) #,marker = list(color = core_cluster_colours_rgba)) 
+
+plot_3d_core <- plot_3d_core %>% layout(
+  title="Core clusters",
+        scene = list(
+      xaxis = list(title = "PC 1"),#,range = c(-2.5,2.5)),
+      yaxis = list(title = "PC 2"),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "PC 3")#,range = c(-2.5,2.5))
+    )) 
+
+plot_3d_core
+
+
+
+
+
+
+
+#-------------
+
+core_only_labels <- c(as.numeric(unlist(core_cluster_labels)))
+
+coloured_points_core_only <- coloured_points_g
+coloured_points_core_only$core_group <- core_cluster_colours
+
+coloured_points_core_only <- coloured_points_core_only[core_only_labels,]
+
+coloured_points_core_only$core_group <- as.numeric(coloured_points_core_only$core_group) #160321 changing to numeric for consistent colour scale with other 3d plots
+
+
+# Table of numbers for core cluster membership
+
+core_member_table <- table(coloured_points_core_only$core_group)
+
+print(xtable(core_member_table,digits=2),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+# Remove X's
+#core_cluster_only_colours <- core_cluster_colours[!(core_cluster_colours %in% c("X"))] #remove non-core points
+
+#coloured_points_core_only$core_group <- core_cluster_only_colours
+
+plot_3d_core_only <- plot_ly(data=coloured_points_core_only,x=coloured_points_core_only$PC1,y=coloured_points_core_only$PC2,z=coloured_points_core_only$PC3,type="scatter3d",color=factor(coloured_points_core_only$core_group),colors = viridis_pal(option = "D")(5))
+
+plot_3d_core_only <- plot_3d_core_only %>% layout(
+  title="Core clusters",
+        scene = list(camera=list(eye=list(x=-0.2,y=-1.2,z=1.75)),
+      xaxis = list(title = "PC 1"),#,range = c(-2.5,2.5)),
+      yaxis = list(title = "PC 2"),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "PC 3")#,range = c(-2.5,2.5))
+    ))
+
+plot_3d_core_only
+
+
+#240321 save html widget for slides
+
+#htmlwidgets::saveWidget(plot_3d_core_only,file="plot_3d_core_only.html")
+
+
+
+plot_2d_1v2_core_only <- ggplot(data=coloured_points_core_only,aes(x=coloured_points_core_only$PC1,y=coloured_points_core_only$PC2)) + geom_point(size=5,aes(color=as.factor(coloured_points_core_only$core_group))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="Core clusters") + xlab("PC1")+ ylab("PC2")+scale_color_viridis(discrete=TRUE)
+plot_2d_1v2_core_only
+
+
+plot_2d_1v3_core_only <- ggplot(data=coloured_points_core_only,aes(x=coloured_points_core_only$PC1,y=coloured_points_core_only$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_core_only$core_group))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="Core clusters") + xlab("PC1")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)
+plot_2d_1v3_core_only
+
+plot_2d_2v3_core_only <- ggplot(data=coloured_points_core_only,aes(x=coloured_points_core_only$PC2,y=coloured_points_core_only$PC3)) + geom_point(size=5,aes(color=as.factor(coloured_points_core_only$core_group))) + scale_color_brewer(palette="Set1") + labs(color = "Cluster", title="Core clusters") + xlab("PC2")+ ylab("PC3")+scale_color_viridis(discrete=TRUE)
+plot_2d_2v3_core_only
+
+
+# Core clusters 2d 3x1 160321
+png("2dplots_core.png",width=1500,height=500,pointsize=18)
+grid.arrange(plot_2d_1v2_core_only,plot_2d_1v3_core_only,plot_2d_2v3_core_only,nrow=1, ncol=3)
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------------------------------------------
+#Core cluster profiles
+
+
+# PSDs
+
+The plots below depict mean power spectral densities + SDs across individuals in each of the final core clusters
+
+
+```{r cluster PSDs,eval=TRUE,echo=FALSE}
+
+
+# Mean and SD PSDs
+
+cz_psds <- data.frame(t(mt_mot_store[32,1:513,1:59]))
+
+table(core_cluster_colours)
+
+cz_psds$core_lab <- core_cluster_colours
+
+core_group1 <- as.matrix(cz_psds[cz_psds$core_lab==1,1:513])
+core_group2 <- as.matrix(cz_psds[cz_psds$core_lab==2,1:513])
+core_group3 <- as.matrix(cz_psds[cz_psds$core_lab==3,1:513])
+core_group4 <- as.matrix(cz_psds[cz_psds$core_lab==4,1:513])
+core_group5 <- as.matrix(cz_psds[cz_psds$core_lab==5,1:513])
+#core_group6 <- as.matrix(cz_psds[cz_psds$core_lab==6,1:513])
+
+  
+# Pieces to plot
+#cz_group1_mean <- colMeans(core_group1)
+#cz_group1_CILB <- matrixStats::colQuantiles(core_group1,probs=0.025)
+#cz_group1_CIUB <- matrixStats::colQuantiles(core_group1,probs=0.975)
+
+# replace bespoke pieces below - define them as stand alone variables above
+psd_group1 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group1))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colQuantiles(core_group1,probs=0.025), ymax=matrixStats::colQuantiles(core_group1,probs=0.975)),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 1") + xlab("Frequency (Hz)") + ylab("Power")
+
+psd_group1
+
+psd_group2 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group2))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colQuantiles(core_group2,probs=0.025), ymax=matrixStats::colQuantiles(core_group2,probs=0.975)),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 2") + xlab("Frequency (Hz)") + ylab("Power")
+
+psd_group2
+
+psd_group3 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group3))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colQuantiles(core_group3,probs=0.025), ymax=matrixStats::colQuantiles(core_group3,probs=0.975)),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 3") + xlab("Frequency (Hz)") + ylab("Power")
+
+psd_group3
+
+psd_group4 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group4))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colQuantiles(core_group4,probs=0.025), ymax=matrixStats::colQuantiles(core_group4,probs=0.975)),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 4") + xlab("Frequency (Hz)") + ylab("Power")
+
+psd_group4
+
+psd_group5 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group5))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colQuantiles(core_group5,probs=0.025), ymax=matrixStats::colQuantiles(core_group5,probs=0.975)),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 5") + xlab("Frequency (Hz)") + ylab("Power")
+
+psd_group5
+
+
+#150221 combining into one plot
+
+library(gridExtra)
+
+grid.arrange(psd_group1,psd_group2,psd_group3,psd_group4,psd_group5,nrow=2,ncol=3)
+
+
+#cz_psds_grouped <- cz_psds %>%  group_by(core_lab) %>% rowwise() %>% 
+#  summarise(mean=list(mean),sd=list(sd))
+
+
+
+# 150221 testing PSD plots with SDs rather than 95% Credible interval/quantile range
+
+
+psd_sd_group1 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group1))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colMeans2(core_group1)-0.5*matrixStats::colSds(core_group1), ymax=matrixStats::colMeans2(core_group1)+0.5*(matrixStats::colSds(core_group1))),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 1") + xlab("Frequency (Hz)") + ylab("Power") #,subtitle= "Shaded region shows SD"
+
+psd_sd_group1
+
+psd_sd_group2 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group2))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colMeans2(core_group2)-0.5*matrixStats::colSds(core_group2), ymax=matrixStats::colMeans2(core_group2)+0.5*(matrixStats::colSds(core_group2))),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 2") + xlab("Frequency (Hz)") + ylab("Power") #,subtitle= "Shaded region shows SD"
+
+psd_sd_group2
+
+psd_sd_group3 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group3))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colMeans2(core_group3)-0.5*matrixStats::colSds(core_group3), ymax=matrixStats::colMeans2(core_group3)+0.5*(matrixStats::colSds(core_group3))),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 3") + xlab("Frequency (Hz)") + ylab("Power") #,subtitle= "Shaded region shows SD"
+
+psd_sd_group3
+
+psd_sd_group4 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group4))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colMeans2(core_group4)-0.5*matrixStats::colSds(core_group4), ymax=matrixStats::colMeans2(core_group4)+0.5*(matrixStats::colSds(core_group4))),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 4") + xlab("Frequency (Hz)") + ylab("Power") #,subtitle= "Shaded region shows SD"
+
+psd_sd_group4
+
+psd_sd_group5 <- ggplot() +
+  geom_line(aes(x=mt_spec$f,y=colMeans(core_group5))) +
+  geom_ribbon(aes(x=mt_spec$f,ymin=matrixStats::colMeans2(core_group5)-0.5*matrixStats::colSds(core_group5), ymax=matrixStats::colMeans2(core_group5)+0.5*(matrixStats::colSds(core_group5))),colour='blue',alpha=0.2) +xlim(0,30) + ylim(0,15) + ggtitle("Core cluster 5") + xlab("Frequency (Hz)") + ylab("Power") #,subtitle= "Shaded region shows SD"
+
+psd_sd_group5
+
+
+
+
+grid.arrange(psd_sd_group1,psd_sd_group2,psd_sd_group3,psd_sd_group4,psd_sd_group5,nrow=2,ncol=3)
+
+
+
+png("psds_larger_010921.png",width=700,height=900,pointsize=14)
+grid.arrange(psd_sd_group1,psd_sd_group2,psd_sd_group3,psd_sd_group4,psd_sd_group5,nrow=3,ncol=2)
+dev.off()
+```
+
+# Frequency scores + PCA Scores - descriptive statistics / eeg profiles
+
+```{r cluster feature profiles}
+
+# Mean and SD frequency features
+
+cluster_profile_feats <- cz_ff_store_orig %>% as_tibble() %>% mutate(core_clust = core_cluster_colours) %>% group_by(core_clust) %>% summarise_all(.funs=list(mean=mean,sd=sd)) %>%  select(core_clust,Cz_peak_f_mean,Cz_peak_f_sd,Cz_sef_95_mean,Cz_sef_95_sd,Cz_tot_pow_mean,Cz_tot_pow_sd,Cz_pow_0_4_mean,Cz_pow_0_4_sd,Cz_pow_4_8_mean,Cz_pow_4_8_sd,Cz_pow_8_12_mean,Cz_pow_8_12_sd,Cz_pow_12_16_mean,Cz_pow_12_16_sd,Cz_spectral_entropy_mean,Cz_spectral_entropy_sd)
+cluster_profile_feats
+
+
+print(xtable(cluster_profile_feats,digits=2),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+
+# v11 PCA loading mean & sd
+
+cluster_profile_PCs <- cz_pca_3$x %>% as_tibble() %>% mutate(core_clust = core_cluster_colours) %>% group_by(core_clust) %>% summarise_all(.funs=list(mean=mean,sd=sd)) %>% select(core_clust,PC1_mean,PC1_sd,PC2_mean,PC2_sd,PC3_mean,PC3_sd,)
+
+#With SDs
+#%>% summarise_all(.funs=list(mean=mean,sd=sd)) %>% select(PC1_mean,PC1_sd, PC2_mean, PC2_sd, PC3_mean,PC3_sd)
+cluster_profile_PCs
+
+
+print(xtable(cluster_profile_PCs,digits=4),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+
+#150221 summary table of Cz summary features across n=59
+#"Cz_peak_f, Cz_sef_95, Cz_tot_pow, Cz_pow_0_4, Cz_pow_4_8, Cz_pow_8_12, Cz_pow_12_16, Cz_spectral_entropy"
+cz_ff_sumtab <- midline_ff_store[,1:8] %>% as_tibble() %>% summarise_all(.funs=list(mean=mean,sd=sd))%>% select(Cz_peak_f_mean,Cz_peak_f_sd, Cz_sef_95_mean,Cz_sef_95_sd, Cz_tot_pow_mean,Cz_tot_pow_sd, Cz_pow_0_4_mean,Cz_pow_0_4_sd, Cz_pow_4_8_mean,Cz_pow_4_8_sd, Cz_pow_8_12_mean,Cz_pow_8_12_sd, Cz_pow_12_16_mean,Cz_pow_12_16_sd, Cz_spectral_entropy_mean,Cz_spectral_entropy_sd)
+cz_ff_sumtab
+
+
+print(xtable(cz_ff_sumtab,digits=4),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+```
+
+
+
+
+COGSTATE
+primary outcomes:
+lmn (reaction time) for DET, IDN, ONB
+acc (accuracy) for TWOB
+
+```{r health_ANOVAs}
+
+
+t1_health_csv <- read.csv('/Volumes/Owen_SSD/t1_health/LABS_data_owen_forbes_20210319.csv')
+
+psych::describe(t1_health_csv)
+
+names(t1_health_csv)
+
+#210321 keeping only 59 clustered
+
+t1_health_csv$ID_string <- as.character(t1_health_csv$ID)
+
+#add leading zero to ID 0199
+t1_health_csv$ID_string[t1_health_csv$ID_string=="199"] <- "0199"
+
+clustered_participant_id <- c(stringr::str_sub(mat_files,start=43,end=46))
+
+#trim t1_health_csv to include only the (59) participants clustered
+t1_health_clustered_participant <- t1_health_csv[t1_health_csv$ID_string %in% clustered_participant_id,]
+
+
+
+
+#210321 testing out diffs between core groups... 
+  #select health outcome variables of interest
+  # group by factor(core_clust)
+#210321 aligning IDs from my work (numerical order) with order in LABS t1 data -- doing this with arrange() %>%  step in piping functions below
+
+  #NB arrange(step) reordering by (alphabetic) order of IDs to align with work above
+  # manual check here to see that old and new order of IDs lines up
+
+  #summary stats for whole group
+t1_anova_df <- data.frame(t1_health_clustered_participant) %>% select("k10_score","sphere12_total","sidas_score","compas_w_wellbeing","psqi_PSQI_SCORE","cogstate_lmn.DET","cogstate_lmn.IDN","cogstate_lmn.ONB","cogstate_acc.TWOB","demographic_age_weeks", "demographic_gender", "demographic_handedness","k10_category","ID_string","yrbs_1")
+# %>% arrange(ID_string) %>% mutate(core_clust = factor(core_cluster_colours),ID_check = clustered_participant_id) 
+
+
+all_cluster_summary <- t1_anova_df %>% summarise_all(.funs=list(mean=mean,sd=sd),na.rm=T)
+
+
+print(xtable(all_cluster_summary,digits=2),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+#@@@@@@@@@ SUMMARY STATS  FOR HEALTH OUTCOMES @@@@@@@@@@@@@@@@@@@@
+# summary stats by core cluster
+# also adding in PC scores columns
+
+
+pc1_scores <- cz_pca_3$x[,1]
+pc2_scores <- cz_pca_3$x[,2]
+pc3_scores <- cz_pca_3$x[,3]
+
+t1_anova_df$gender_numeric <- ifelse(t1_anova_df$demographic_gender=="Male",0,1)
+t1_anova_df$gender_factor <- factor(t1_anova_df$demographic_gender)
+
+
+t1_anova_df_grouped_clust <- t1_anova_df %>% arrange(ID_string) %>% mutate(core_clust = factor(core_cluster_colours),ID_check = clustered_participant_id,pc1 = pc1_scores, pc2 = pc2_scores, pc3=pc3_scores,sidas_logp1 = log(sidas_score+1),k10_disorder = ifelse(k10_score < 20,0,1)) %>% group_by(core_clust)
+
+
+#select relevant variables for summary stats, leave out "X" category!!!!!!@@@@@@@@@@@@
+each_cluster_summary <- t1_anova_df_grouped_clust %>% select(core_clust,k10_score,sphere12_total,sidas_score,compas_w_wellbeing,psqi_PSQI_SCORE,cogstate_lmn.DET,cogstate_lmn.IDN,cogstate_lmn.ONB,cogstate_acc.TWOB,demographic_age_weeks,demographic_gender) %>% group_by(core_clust) %>% filter(core_clust != "X")
+
+#separate table for mean and SD for convenience getting into LATEX... also transpose so clusters as columns
+each_cluster_summary_mean <- each_cluster_summary %>% summarise_all(.funs=list(mean=mean),na.rm=T)
+each_cluster_summary_mean <- as_tibble(cbind(nms = names(each_cluster_summary_mean), t(each_cluster_summary_mean)))
+
+each_cluster_summary_sd <- each_cluster_summary %>% summarise_all(.funs=list(sd=sd),na.rm=T)
+each_cluster_summary_sd <- as_tibble(cbind(nms = names(each_cluster_summary_sd), t(each_cluster_summary_sd)))
+
+#each_cluster_gender <- each_cluster_summary %>% group_by(demographic_gender) %>% summarise(no_rows = length(demographic_gender))
+
+each_cluster_summary %>% count(demographic_gender)
+
+print(xtable(each_cluster_summary_mean),floating=FALSE,latex.environments=NULL,booktabs=TRUE,digits=2)
+print(xtable(each_cluster_summary_sd,digits=c(2,2,2,2,2,2,2)))
+
+
+#------------------
+
+
+#chi square test comparing disorder label between groups
+table(t1_anova_df_grouped_clust$core_clust,t1_anova_df_grouped_clust$k10_disorder)
+
+fisher.test(t1_anova_df_grouped_clust$core_clust,t1_anova_df_grouped_clust$k10_disorder)
+
+
+
+# Comparing age and gender between clusters - no major diffs
+
+#gender
+table(t1_anova_df_grouped_clust$core_clust,t1_anova_df_grouped_clust$gender_numeric)
+fisher.test(t1_anova_df_grouped_clust$core_clust,t1_anova_df_grouped_clust$gender_numeric)
+
+#age
+
+t1_anova_df_grouped_clust %>% summarise(mean_age = mean(demographic_age_weeks))
+summary(aov(demographic_age_weeks~core_clust,data=t1_anova_df_grouped_clust))
+
+
+
+
+
+
+
+```
+
+Exploratory group comparisons (frequentist methods)
+
+
+```{r testing group comps}
+#-----------------------
+
+
+#!!!!!!  Try with removing un-clustered (X) - remove "_noX" to test
+
+t1_anova_df_grouped_clust_noX <- t1_anova_df_grouped_clust[t1_anova_df_grouped_clust$core_clust!="X",]
+t1_anova_df_grouped_clust_noX$core_clust <- droplevels(t1_anova_df_grouped_clust_noX$core_clust )
+
+
+
+# Relevel core_clust to have reference category as 1
+
+t1_anova_df_grouped_clust_noX$core_clust <- relevel(t1_anova_df_grouped_clust_noX$core_clust,ref="1")
+
+#t1_anova_df_grouped_clust <- t1_anova_df_grouped_clust[t1_anova_df_grouped_clust$core_clust!="X",]
+#t1_anova_df_grouped_clust$core_clust <- droplevels(t1_anova_df_grouped_clust_noX$core_clust )
+
+
+
+#-----------------------
+
+#quick power analysis
+
+pwr::pwr.anova.test(k=5,n=9,power=0.8) #f=0.546
+
+# pwr::pwr.anova.test(k=5,n=10,power=0.8) #f=0.515
+
+
+
+
+#----------------------
+# ANOVAs 160421
+
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+# Shapiro tests for residuals 
+
+# Do KW for: k10; SIDAS; COMPAS-W; lmn.DET
+
+# Do ANOVA for: sphere12; PSQI; lmn.IDN; lmn.ONB; acc.TWOB
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+#ANOVA- significant:PSQI; lmn.IDN; acc.TWOB !!! @@@@@@@@@@@@@@@@@@@@@@@@@@
+#KW - significant: cogstate_lmn.DET !!! @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+# AGE 090621
+
+# age_anova <-aov(demographic_age_weeks~core_clust,data=t1_anova_df_grouped_clust_noX)
+# 
+# summary(age_anova)
+# shapiro.test(residuals(age_anova))
+# 
+# # Significant Shapiro result - use KW
+
+kruskal.test(demographic_age_weeks ~ core_clust, data=t1_anova_df_grouped_clust_noX)
+
+
+
+
+#k10_anova <- aov(k10_score ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+# summary(k10_anova)
+
+#shapiro.test(residuals(k10_anova)) 
+# 
+# TukeyHSD(k10_anova)
+# 
+
+sphere12_anova <- aov(sphere12_total ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+summary(sphere12_anova)
+
+shapiro.test(residuals(sphere12_anova))
+
+# 
+# TukeyHSD(sphere12_anova)
+# 
+
+#sidas_anova <- aov(sidas_score ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+# summary(sidas_anova)
+
+#shapiro.test(residuals(sidas_anova))
+
+# 
+# TukeyHSD(sidas_anova)
+
+#compas_anova <- aov(compas_w_wellbeing ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+# summary(compas_anova)
+# 
+#shapiro.test(residuals(compas_anova))
+
+# TukeyHSD(compas_anova)
+
+
+
+
+psqi_anova <- aov(psqi_PSQI_SCORE ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+summary(psqi_anova)
+
+shapiro.test(residuals(psqi_anova))
+
+
+#TukeyHSD(psqi_anova)
+
+
+
+
+#cogstate_lmn_DET_anova <- aov(cogstate_lmn.DET ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+# summary(cogstate_lmn_DET_anova)
+
+#shapiro.test(residuals(cogstate_lmn_DET_anova))
+
+# 
+# TukeyHSD(cogstate_lmn_DET_anova)
+
+
+cogstate_lmn_IDN_anova <- aov(cogstate_lmn.IDN ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+summary(cogstate_lmn_IDN_anova)
+
+shapiro.test(residuals(cogstate_lmn_IDN_anova))
+
+#TukeyHSD(cogstate_lmn_IDN_anova)
+
+
+cogstate_lmn_ONB_anova <- aov(cogstate_lmn.ONB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+summary(cogstate_lmn_ONB_anova)
+
+shapiro.test(residuals(cogstate_lmn_ONB_anova))
+
+
+cogstate_acc_TWOB_anova <- aov(cogstate_acc.TWOB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+summary(cogstate_acc_TWOB_anova)
+
+shapiro.test(residuals(cogstate_acc_TWOB_anova))
+
+# 
+# TukeyHSD(cogstate_acc_TWOB_anova)
+
+
+
+
+#------ cogstate trash variables
+
+#cogstate_lmn_TWOB_anova <- aov(cogstate_lmn.TWOB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+#summary(cogstate_lmn_TWOB_anova)
+
+
+
+
+#cogstate_acc_DET_anova <- aov(cogstate_acc.DET ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+#summary(cogstate_acc_DET_anova)
+
+#cogstate_acc_IDN_anova <- aov(cogstate_acc.IDN ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+#summary(cogstate_acc_IDN_anova)
+
+#TukeyHSD(cogstate_acc_IDN_anova)
+
+#cogstate_acc_ONB_anova <- aov(cogstate_acc.ONB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+#summary(cogstate_acc_ONB_anova)
+
+
+
+
+
+#--------------------------------
+
+# SANITY CHECK anovas for PC scores
+
+pc1_anova <- aov(pc1 ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+summary(pc1_anova)
+
+pc2_anova <- aov(pc2 ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+summary(pc2_anova)
+
+pc3_anova <- aov(pc3 ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+summary(pc3_anova)
+
+
+#------------------------------
+
+#Bayesian ANOVAs
+
+library(BayesFactor)
+
+#k10_anova_BF <- anovaBF( 
+# formula = k10_score ~ core_clust,
+# data = t1_anova_df_grouped_clust_noX
+#)
+#k10_anova_BF
+
+
+sphere12_anova_BF <- anovaBF( 
+ formula = sphere12_total ~ core_clust,
+ data = t1_anova_df_grouped_clust_noX
+)
+sphere12_anova_BF
+
+
+psqi_anova_BF <- anovaBF( 
+ formula = psqi_PSQI_SCORE ~ core_clust,
+ data = t1_anova_df_grouped_clust_noX[!is.na(t1_anova_df_grouped_clust_noX$psqi_PSQI_SCORE),]
+)
+psqi_anova_BF
+
+#.....
+
+lmn_IDN_anova_BF <- anovaBF( 
+ formula = cogstate_lmn.IDN ~ core_clust,
+ data = t1_anova_df_grouped_clust_noX
+)
+lmn_IDN_anova_BF
+
+
+
+
+
+
+#-----------------------------
+
+# Try removing outlier for SIDAS
+
+t1_anova_df_grouped_clust_noX_sidas_outlier <- t1_anova_df_grouped_clust_noX[t1_anova_df_grouped_clust_noX$sidas_score<50,]
+
+#-----------------------------
+
+#Exploratory boxplots
+
+boxplot(k10_score ~ core_clust, data=t1_anova_df_grouped_clust_noX)
+
+boxplot(sphere12_total ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+
+boxplot(sidas_score ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+
+#SIDAS with outlier removed
+#boxplot(sidas_score ~ core_clust, data = t1_anova_df_grouped_clust_noX_sidas_outlier)
+
+
+boxplot(compas_w_wellbeing ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+
+boxplot(psqi_PSQI_SCORE ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+
+
+
+boxplot(cogstate_lmn.DET ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+boxplot(cogstate_lmn.IDN ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+boxplot(cogstate_lmn.ONB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+#boxplot(cogstate_lmn.TWOB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+
+
+# boxplot(cogstate_acc.DET ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+# 
+# boxplot(cogstate_acc.IDN ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+# 
+# boxplot(cogstate_acc.ONB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+boxplot(cogstate_acc.TWOB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+
+
+#-----------------------
+
+# exploratory lm's based on continuous PC scores
+
+
+summary(lm(k10_score ~ pc1 + pc2 + pc3, data=t1_anova_df_grouped_clust_noX))
+
+summary(lm(sphere12_total ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+summary(lm(sidas_score ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+#SIDAS with outlier removed
+summary(lm(sidas_score ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX_sidas_outlier))
+
+
+summary(lm(compas_w_wellbeing ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+summary(lm(psqi_PSQI_SCORE ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+summary(lm(cogstate_lmn.DET ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) 
+
+summary(lm(cogstate_lmn.IDN ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+summary(lm(cogstate_lmn.ONB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+#summary(lm(cogstate_lmn.TWOB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) 
+
+
+
+#summary(lm(cogstate_acc.DET ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) 
+
+#summary(lm(cogstate_acc.IDN ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+#summary(lm(cogstate_acc.ONB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+
+summary(lm(cogstate_acc.TWOB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) 
+
+```
+
+Potential group comparisons:
+
+- non-parametric distribution comparison (Kruskal-Wallis)
+- lm's
+    - cluster (categorical predictor)
+    - PC scores (continuous predictor)
+- brms
+    - cluster (categorical predictor)
+    - PC scores (continuous predictor)
+- pairwise.t.test()
+
+
+
+COGSTATE
+primary outcomes:
+lmn (reaction time) for DET, IDN, ONB
+acc (accuracy) for TWOB
+
+
+```{r group comparison Edgar}
+
+#-------------------------------------------------------------------------------------------
+
+#@@@@@@@@@@@@@@@@@@@@@@@
+# Shapiro tests for residuals 
+
+# Do KW for: k10; SIDAS; COMPAS-W; lmn.DET
+
+# Do ANOVA for: sphere12; PSQI; lmn.IDN; lmn.ONB; acc.TWOB
+
+#@@@@@@@@@@@@@@@@@@@@@@@
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+#ANOVA- significant:PSQI; lmn.IDN; acc.TWOB !!! @@@@@@@@@@@@@@@@@@@@@@@@@@
+#KW - significant: cogstate_lmn.DET !!! @@@@@@@@@@@@@@@@@@@@@@@@@@
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+# Kruskal-Wallis test (NP ANOVAs)
+
+## cogstate_lmn.DET, cogstate_lmn.IDN = sig (cool!)
+## PSQI (p=0.09), cogstate_lmn.ONB (.11), cogstate_acc.TWOB (.09) = marginal (p cool!)
+## SPHERE-12 (.23)
+
+
+kruskal.test(k10_score ~ core_clust, data=t1_anova_df_grouped_clust_noX)
+
+#kruskal.test(sphere12_total ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+
+kruskal.test(sidas_score ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+
+kruskal.test(compas_w_wellbeing ~ core_clust, data = t1_anova_df_grouped_clust_noX)
+
+#kruskal.test(psqi_PSQI_SCORE ~ core_clust, data = t1_anova_df_grouped_clust_noX) # - removed here, using ANOVA since responses appear normally
+
+
+kruskal.test(cogstate_lmn.DET ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+#kruskal.test(cogstate_lmn.IDN ~ core_clust, data = t1_anova_df_grouped_clust_noX)  # - removed here, using ANOVA since responses appear normally distributed
+
+#kruskal.test(cogstate_lmn.ONB ~ core_clust, data = t1_anova_df_grouped_clust_noX) # - removed here, using ANOVA since responses appear normally distributed
+
+#kruskal.test(cogstate_acc.TWOB ~ core_clust, data = t1_anova_df_grouped_clust_noX) 
+
+
+#-------------------------------------------------------------------------------------------
+
+
+# Categorical LMs (groups)
+
+
+# #summary(lm(k10_score ~ core_clust, data=t1_anova_df_grouped_clust_noX))
+# 
+# sphere12_lm <- lm(sphere12_total ~ core_clust, data = t1_anova_df_grouped_clust_noX) #2v1 sig, estimate = 2.6, p<0.05
+# summary(sphere12_lm)
+# sphere12_lm %>% emmeans(pairwise ~ core_clust)
+# 
+# 
+# #summary(lm(sidas_score ~ core_clust, data = t1_anova_df_grouped_clust_noX)) #3v1 marginal, estimate = 6.4222, p = 0.086 (OUTLIER DRIVEN)
+# 
+# #summary(lm(compas_w_wellbeing ~ core_clust, data = t1_anova_df_grouped_clust_noX)) 
+# 
+# summary(lm(psqi_PSQI_SCORE ~ core_clust, data = t1_anova_df_grouped_clust_noX)) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# summary(lm(cogstate_lmn.DET ~ core_clust, data = t1_anova_df_grouped_clust_noX)) #2v1 marginal, estimate = -0.068, p=0.0759. 
+# #4v1 marginal, estimate = -0.067, p = 0.1077
+# 
+# summary(lm(cogstate_lmn.IDN ~ core_clust, data = t1_anova_df_grouped_clust_noX)) #2v1 SIGNIFICANT, estimate = -0.07239, p = 0.0059. 
+# #4v1 SIGNIFICANT, estimate = -0.063, p = 0.0245
+# 
+# summary(lm(cogstate_lmn.ONB ~ core_clust, data = t1_anova_df_grouped_clust_noX)) #4v1 marginal, estimate = 0.069, p = 0.0925
+# 
+# 
+# summary(lm(cogstate_acc.TWOB ~ core_clust, data = t1_anova_df_grouped_clust_noX)) #3v1 sig, estimate = -0.20075, p = 0.0135
+# 
+# 
+# 
+# #-------------------------------------------------------------------------------------------
+# 
+# # Continuous LMs (PC scores)
+# 
+# summary(lm(k10_score ~ pc1 + pc2 + pc3, data=t1_anova_df_grouped_clust_noX))
+# 
+# summary(lm(sphere12_total ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) #pc2 almost
+# 
+# summary(lm(sidas_score ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) #pc2 almost #pc3 almost
+# 
+# summary(lm(compas_w_wellbeing ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) #pc2 almost #pc3 almost
+# 
+# summary(lm(psqi_PSQI_SCORE ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) #pc2 sig
+# 
+# summary(lm(cogstate_lmn.DET ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) #pc1 almost
+# 
+# summary(lm(cogstate_lmn.IDN ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) #pc1 sig #pc2 sig-ish (0.0506) @@@@@@@@@
+# 
+# summary(lm(cogstate_lmn.ONB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) #pc2 almost
+# 
+# summary(lm(cogstate_lmn.TWOB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) 
+# 
+# 
+# 
+# summary(lm(cogstate_acc.DET ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX)) 
+# 
+# summary(lm(cogstate_acc.IDN ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))
+# 
+# summary(lm(cogstate_acc.ONB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))  #pc2 sig (not a primary outcome for Cogstate)
+# 
+# summary(lm(cogstate_acc.TWOB ~ pc1 + pc2 + pc3, data = t1_anova_df_grouped_clust_noX))  #pc2 sig
+
+
+```
+
+
+
+
+
+
+
+# BRMS prior sensitivity analyses & testing age and sex covariates
+
+
+
+```{r brms}
+
+set.seed(122)
+
+#-------------------------------------------------------------------------------------------
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+#ANOVA- significant:PSQI; lmn.IDN; acc.TWOB !!! @@@@@@@@@@@@@@@@@@@@@@@@@@
+#KW - significant: cogstate_lmn.DET !!! @@@@@@@@@@@@@@@@@@@@@@@@@@
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+# Bayesian categorical lms (brms - by cluster)
+
+
+brms_k10 <- brms::brm(bf(k10_score ~ core_clust), data=t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4)
+#brms_k10
+#emmeans(brms_k10,pairwise ~ core_clust) # nuthin'
+# 
+# 
+brms_sphere12 <- brms::brm(bf(sphere12_total ~ core_clust), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #2v1 sig, estimate = 2.6, p<0.05
+# brms_sphere12
+# emmeans(brms_sphere12,pairwise ~ core_clust) # zilch
+# 
+brms_sidas <- brms::brm(bf(sidas_score ~ core_clust), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 6.4222, p = 0.086 (OUTLIER DRIVEN)
+# brms_sidas
+# emmeans(brms_sidas, pairwise ~ core_clust) # no dice
+
+# 
+# 
+brms_compasw <- brms::brm(bf(compas_w_wellbeing ~ core_clust), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) 
+# brms_compasw
+# emmeans(brms_compasw, pairwise ~ core_clust) # nada
+
+
+#-----------------------------------------
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+# SIDAS OUTLIER REMOVED testing 240621
+# All contrasts disappear - higher suicidality in 3 is entirely driven by the one outlier
+
+#brms_sidas_outlier <- brms::brm(bf(sidas_score ~ core_clust), data = t1_anova_df_grouped_clust_noX_sidas_outlier,iter=10000,warmup=2000,family=gaussian,cores=4)
+
+#hypothesis_fn(brms_sidas_outlier)
+#emmeans(brms_sidas_outlier, pairwise ~ core_clust)
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+#-----------------------------------------
+
+
+
+#@@@@@@@@@@@@@@@@@@@@@ 100521
+# Prior sensitivity normal and t
+
+#priors_normal <- c(prior(normal(0, 10), class = b, coef = "core_clust"),prior_string("normal(0, 10)", class = "b", coef = paste("core_clust", 2:5, sep="")))
+
+priors_normal <- prior_string("normal(0,10)", class = "b") # normal prior for betas with mu 0, sigma 10
+
+priors_t <- prior_string("student_t(2, 0, 10)", class = "b") # t dist for beta's with df 2, mu 0, sigma 10
+
+
+
+
+#110521 testing gender
+
+# PSQI
+
+# 
+# brms_psqi_sex <- brms::brm(bf(psqi_PSQI_SCORE ~ gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4)
+# brms_psqi_sex
+
+#univariate model for sex - b includes zero
+
+
+brms_psqi <- brms::brm(bf(psqi_PSQI_SCORE ~ core_clust + gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# 5v1 marginal, estimate = -2.13, p=0.143
+brms_psqi
+# summary(brms_psqi)
+# prior_summary(brms_psqi)
+# 
+# emmeans(brms_psqi,pairwise ~ core_clust) #3v4 and 3v5 CIs exclude zero
+# 
+# psqi_emm <- emmeans(brms_psqi,pairwise ~ core_clust) #3v4 and 3v5 CIs exclude zero
+# 
+# 
+
+#-----------------------------------------------------------------------------------------------------------
+
+# PSQI - SIDAS OUTLIER REMOVED testing 240621
+# NO MAJOR DIFFS NOTICED in terms of posterior probs for contrasts
+
+#brms_psqi_outlier <- brms::brm(bf(psqi_PSQI_SCORE ~ core_clust), data = t1_anova_df_grouped_clust_noX_sidas_outlier,iter=10000,warmup=2000,family=gaussian,cores=4)
+
+#hypothesis_fn(brms_psqi_outlier)
+#emmeans(brms_psqi_outlier, pairwise ~ core_clust)
+
+
+#-----------------------------------------------------------------------------------------------------------
+
+# 
+# # normal prior on coefficients
+# 
+# brms_normal_psqi <- brms::brm(bf(psqi_PSQI_SCORE ~ core_clust + gender_factor), prior=priors_normal,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_normal_psqi)
+# brms_normal_psqi
+# summary(brms_normal_psqi)
+# 
+# emmeans(brms_normal_psqi,pairwise ~ core_clust) #3v4 and 3v5 CIs exclude zero
+# 
+# 
+# # t prior on coefficients
+# 
+# brms_t_psqi <- brms::brm(bf(psqi_PSQI_SCORE ~ core_clust + gender_factor), prior=priors_t,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_t_psqi)
+# brms_t_psqi
+# summary(brms_t_psqi)
+# prior_summary(brms_t_psqi)
+# 
+# 
+# emmeans(brms_t_psqi,pairwise ~ core_clust)
+# 
+
+
+#-----------------------------------------
+
+# lmn.DET
+
+# 
+# brms_lmn.DET_sex <- brms::brm(bf(cogstate_lmn.DET ~ gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4)
+# brms_lmn.DET_sex
+
+#univariate model for sex - b includes zero
+
+
+brms_lmn.DET <- brms::brm(bf(cogstate_lmn.DET ~ core_clust + gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #2v1 marginal, estimate = -0.068, p=0.0759. 
+#4v1 marginal, estimate = -0.067, p = 0.1077
+brms_lmn.DET
+# emmeans(brms_lmn.DET,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+# 
+#
+#-------------------------------------------------------------------------------------------------------
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+# lmn.DET - SIDAS OUTLIER REMOVED testing 240621
+
+# Contrasts with cluster 3 being slower than others disappear; cluster 1 now slower than cluster 3
+
+
+#brms_lmn.DET_outlier <- brms::brm(bf(cogstate_lmn.DET ~ core_clust), data = t1_anova_df_grouped_clust_noX_sidas_outlier,iter=10000,warmup=2000,family=gaussian,cores=4)
+
+#hypothesis_fn(brms_lmn.DET_outlier)
+#emmeans(brms_lmn.DET_outlier, pairwise ~ core_clust)
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+#-------------------------------------------------------------------------------------------------------
+# 
+# brms_normal_lmn.DET <- brms::brm(bf(cogstate_lmn.DET ~ core_clust + gender_factor), prior=priors_normal,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_normal_lmn.DET)
+# brms_normal_lmn.DET
+# summary(brms_normal_lmn.DET)
+# 
+# emmeans(brms_normal_lmn.DET,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+# 
+# 
+# 
+# brms_t_lmn.DET <- brms::brm(bf(cogstate_lmn.DET ~ core_clust + gender_factor), prior=priors_t,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_t_lmn.DET)
+# brms_t_lmn.DET
+# summary(brms_t_lmn.DET)
+# 
+# emmeans(brms_t_lmn.DET,pairwise ~ core_clust) #1v2 CI excludes zero 
+# # 1v4 with T prior INCLUDES ZERO marginally (95% credible interval -0.015, 1.14)
+# 
+
+
+
+
+
+#-----------------------------------------
+
+# lmn.IDN
+# 
+# brms_lmn.IDN_sex <- brms::brm(bf(cogstate_lmn.IDN ~ gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4)
+# brms_lmn.IDN_sex
+# 
+# # univariate model for sex - b includes zero
+
+
+
+brms_lmn.IDN <- brms::brm(bf(cogstate_lmn.IDN ~ core_clust + gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #2v1 SIGNIFICANT, estimate = -0.07239, p = 0.0059. 
+#4v1 SIGNIFICANT, estimate = -0.063, p = 0.0245
+brms_lmn.IDN
+# emmeans(brms_lmn.IDN,pairwise ~ core_clust) #1v2, 1v4, 2v3, 3v4, all have CI excludes zero (2 and 4 substantially lower than 1 and 3)
+# 
+# 
+# # normal prior on coefficients
+# 
+# brms_normal_lmn.IDN <- brms::brm(bf(cogstate_lmn.IDN ~ core_clust + gender_factor), prior=priors_normal,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_normal_lmn.IDN)
+# brms_normal_lmn.IDN
+# summary(brms_normal_lmn.IDN)
+# 
+# emmeans(brms_normal_lmn.IDN,pairwise ~ core_clust) #1v2, 1v4, 2v3, 3v4, all have CI excludes zero (2 and 4 substantially lower than 1 and 3)
+# 
+# 
+# 
+# # t prior on coefficients
+# 
+# brms_t_lmn.IDN <- brms::brm(bf(cogstate_lmn.IDN ~ core_clust + gender_factor), prior=priors_t,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_t_lmn.IDN)
+# brms_t_lmn.IDN
+# summary(brms_t_lmn.IDN)
+# 
+# emmeans(brms_t_lmn.IDN,pairwise ~ core_clust) #1v2, 1v4, 2v3, 3v4, all have CI excludes zero (2 and 4 substantially lower than 1 and 3)
+# 
+
+
+#-----------------------------------------
+
+
+brms_lmn.ONB <- brms::brm(bf(cogstate_lmn.ONB ~ core_clust), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #4v1 marginal, estimate = 0.069, p = 0.0925
+# brms_lmn.ONB
+# emmeans(brms_lmn.ONB, pairwise ~ core_clust) #1v2, 1v4, 2v3 kinda close
+
+
+#-----------------------------------------
+
+# acc.TWOB
+
+# 
+# brms_acc.TWOB_sex <- brms::brm(bf(cogstate_acc.TWOB ~ gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4)
+# brms_acc.TWOB_sex
+
+# univariate model for sex - b includes zero
+
+
+brms_acc.TWOB <- brms::brm(bf(cogstate_acc.TWOB ~ core_clust + gender_factor), data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 sig, estimate = -0.20075, p = 0.0135
+brms_acc.TWOB
+# emmeans(brms_acc.TWOB,pairwise ~ core_clust) #1v3, 3v4 exclude zero; 2v4 close
+# 
+# 
+# # normal prior on coefficients
+# 
+# brms_normal_acc.TWOB <- brms::brm(bf(cogstate_acc.TWOB ~ core_clust + gender_factor), prior=priors_normal,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_normal_acc.TWOB)
+# brms_normal_acc.TWOB
+# summary(brms_normal_acc.TWOB)
+# 
+# emmeans(brms_normal_acc.TWOB,pairwise ~ core_clust)  #1v3, 3v4 exclude zero; 2v4 close
+# 
+# 
+# # t prior on coefficients
+# 
+# brms_t_acc.TWOB <- brms::brm(bf(cogstate_acc.TWOB ~ core_clust + gender_factor), prior=priors_t,data = t1_anova_df_grouped_clust_noX,iter=10000,warmup=2000,family=gaussian,cores=4) #3v1 marginal, estimate = 1.8667, p = 0.0569.
+# # 5v1 marginal, estimate = -2.13, p=0.143
+# 
+# prior_summary(brms_t_acc.TWOB)
+# brms_t_acc.TWOB
+# summary(brms_t_acc.TWOB)
+# 
+# emmeans(brms_t_acc.TWOB,pairwise ~ core_clust) #1v3, 3v4 exclude zero; 2v4 close
+# 
+
+
+```
+
+
+
+
+
+
+
+
+
+Violin plots
+
+
+```{r violin plots}
+
+# NEED TO ADD TITLES AND AXIS LABELS
+
+violin_yrbs_1 <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=yrbs_1))+geom_violin()+geom_boxplot(width=0.05)#+geom_point()
+violin_yrbs_1
+
+violin_k10 <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=k10_score))+geom_violin()+geom_boxplot(width=0.05)#+geom_point()
+violin_k10
+
+violin_sphere12 <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=sphere12_total))+geom_violin()+geom_boxplot(width=0.05)
+violin_sphere12
+
+violin_sidas <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=sidas_logp1))+geom_violin()+geom_boxplot(width=0.05)
+violin_sidas
+
+
+violin_sidas_outlier <- ggplot(data=t1_anova_df_grouped_clust_noX_sidas_outlier, aes(x=core_clust,y=sidas_score))+geom_violin()+geom_boxplot(width=0.05)
+violin_sidas_outlier
+
+violin_compasw <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=compas_w_wellbeing))+geom_violin()+geom_boxplot(width=0.05)
+violin_compasw
+
+violin_psqi <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=psqi_PSQI_SCORE))+geom_violin()+geom_boxplot(width=0.05)#+geom_point(alpha=0.3)
+violin_psqi
+
+violin_lmn_DET <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=cogstate_lmn.DET))+geom_violin()+geom_boxplot(width=0.05)#+geom_point(alpha=0.3)
+violin_lmn_DET
+
+violin_lmn_IDN <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=cogstate_lmn.IDN))+geom_violin()+geom_boxplot(width=0.05)#+geom_point(alpha=0.3)
+violin_lmn_IDN
+
+violin_lmn_ONB <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=cogstate_lmn.ONB))+geom_violin()+geom_boxplot(width=0.05)
+violin_lmn_ONB
+
+violin_acc_TWOB <- ggplot(data=t1_anova_df_grouped_clust_noX, aes(x=core_clust,y=cogstate_acc.TWOB))+geom_violin()+geom_boxplot(width=0.05)
+violin_acc_TWOB
+
+
+
+png("violin_plots.png",width=1500,height=1500,pointsize=18)
+grid.arrange(violin_k10, violin_sphere12, violin_sidas, violin_compasw, violin_psqi, violin_lmn_DET, violin_lmn_IDN, violin_lmn_ONB, violin_acc_TWOB, nrow=3, ncol=3)
+dev.off()
+
+
+```
+
+
+
+
+#Posterior probabilities for outcome greater in cluster A > B
+
+
+VERY HELPFUL LINK FOR STAN POSTERIOR ANALYSIS using hypothesis(model, "comparison")
+# https://discourse.mc-stan.org/t/pairwise-mean-comparison-brms/13098
+
+
+```{r posterior probability cluster comparisons}
+
+
+# # SAVE AND LOAD BRMS OUTPUT FOR PAPER
+# 
+# brms_outputs <- list(brms_psqi_final,brms_lmn.DET_final,brms_lmn.IDN_final,brms_acc.TWOB_final,brms_k10,brms_sphere12,brms_sidas,brms_compasw,brms_lmn.ONB)
+
+# @ 210621 Janky line above for stitching together final results for first 4 (_final), plus NEW final results for other 5 measures
+# save(brms_outputs,file="brms_outputs_210621")
+
+
+load("brms_outputs_210621")  #@@@@@@@ RUN THIS LINE FOR MODEL RESULTS FOR PAPER
+
+
+#----------------------
+
+brms_psqi_final <- brms_outputs[[1]]
+brms_lmn.DET_final <- brms_outputs[[2]]
+brms_lmn.IDN_final <- brms_outputs[[3]]
+brms_acc.TWOB_final <- brms_outputs[[4]]
+brms_k10_final <- brms_outputs[[5]]
+brms_sphere12_final <- brms_outputs[[6]]
+brms_sidas_final <- brms_outputs[[7]]
+brms_compasw_final <- brms_outputs[[8]]
+brms_lmn.ONB_final <- brms_outputs[[9]]
+
+
+
+#VERY HELPFUL LINK FOR STAN POSTERIOR ANALYSIS using hypothesis(model, "comparison")
+# https://discourse.mc-stan.org/t/pairwise-mean-comparison-brms/13098
+
+
+```
+
+# BRMS Posterior Probabilities - outputs for paper
+
+```{r}
+#--------------
+
+
+# FOR PAPER - posterior probs
+# posterior probabilities for pairwise cluster contrasts from brms models
+
+
+
+#-------
+
+hypothesis_fn <- function(brms_model){
+
+results <- vector(mode = "list", length = 10)
+results[1] <- hypothesis(brms_model, "Intercept + core_clust2 < Intercept") #NB LESS THAN (for cluster 1 > cluster N)
+results[2] <- hypothesis(brms_model, "Intercept + core_clust3 < Intercept")
+results[3] <- hypothesis(brms_model, "Intercept + core_clust4 < Intercept")
+results[4] <- hypothesis(brms_model, "Intercept + core_clust5 < Intercept")
+
+results[5] <- hypothesis(brms_model, "Intercept + core_clust2 > Intercept + core_clust3")
+results[6] <- hypothesis(brms_model, "Intercept + core_clust2 > Intercept + core_clust4")
+results[7] <- hypothesis(brms_model, "Intercept + core_clust2 > Intercept + core_clust5")
+
+results[8] <- hypothesis(brms_model, "Intercept + core_clust3 > Intercept + core_clust4")
+results[9] <- hypothesis(brms_model, "Intercept + core_clust3 > Intercept + core_clust5")
+
+results[10] <- hypothesis(brms_model, "Intercept + core_clust4 > Intercept + core_clust5")
+
+return(results)
+}
+
+#------
+
+
+#subset like: probs_psqi[[1]]$Post.Prob
+
+probs_psqi <- hypothesis_fn(brms_psqi_final)
+probs_lmn.DET <- hypothesis_fn(brms_lmn.DET_final)
+probs_lmn.IDN <- hypothesis_fn(brms_lmn.IDN_final)
+probs_acc.TWOB <- hypothesis_fn(brms_acc.TWOB_final)
+probs_k10 <- hypothesis_fn(brms_k10_final)
+probs_sphere12 <- hypothesis_fn(brms_sphere12_final)
+probs_sidas <- hypothesis_fn(brms_sidas_final)
+probs_compasw <- hypothesis_fn(brms_compasw_final)
+probs_lmn.ONB <- hypothesis_fn(brms_lmn.ONB_final)
+
+##210621 - how do I subset the right column from each of these entries???
+# LIKE THIS probs_psqi[[1]]$Post.Prob
+
+
+#---------------------------
+
+#Posterior probabilities table + heatmap for paper   
+
+
+# function to extract and concatenate relevant prob values from each hypothesis() item
+prob_vec_fn <- function(probs_list){
+  prob_vec <- c(rep(NA,length(probs_list)))
+  for(i in 1:length(probs_list)){
+    prob_vec[i] <- probs_list[[i]]$Post.Prob
+  }
+  prob_vec
+}
+
+posterior_probs_table <- data.frame(Contrast = rep(NA,10))
+posterior_probs_table$Contrast <- c("1 > 2", "1 > 3", "1 > 4", "1 > 5", "2 > 3", "2 > 4", "2 > 5", "3 > 4", "3 > 5", "4 > 5")
+posterior_probs_table$K10 <- prob_vec_fn(probs_k10)
+posterior_probs_table$`SPHERE-12` <- prob_vec_fn(probs_sphere12)
+posterior_probs_table$SIDAS <- prob_vec_fn(probs_sidas)
+posterior_probs_table$`COMPAS-W` <- prob_vec_fn(probs_compasw)
+posterior_probs_table$PSQI <- prob_vec_fn(probs_psqi)
+posterior_probs_table$`DET - RT` <- prob_vec_fn(probs_lmn.DET)
+posterior_probs_table$`IDN - RT` <- prob_vec_fn(probs_lmn.IDN)
+posterior_probs_table$`OBK - RT` <- prob_vec_fn(probs_lmn.ONB)
+posterior_probs_table$`TWOB - Acc` <- prob_vec_fn(probs_acc.TWOB)
+
+print(xtable(posterior_probs_table,digits=2),floating=FALSE,latex.environments=NULL,booktabs=TRUE)
+
+
+
+
+#---------------
+
+# Posterior probs heatmap for paper
+
+posterior_probs_table_long <- posterior_probs_table %>% pivot_longer(cols=-"Contrast",names_to = "Measure")
+
+posterior_probs_table_long$Measure <- factor(posterior_probs_table_long$Measure,levels=c("K10","SPHERE-12","SIDAS","COMPAS-W","PSQI","DET - RT","IDN - RT","OBK - RT","TWOB - Acc"))
+
+posterior_probs_table_long$Contrast <-  factor(posterior_probs_table_long$Contrast) 
+
+# creating type variable for adding white space to delineate conceptually linked measures for heatmap
+# see https://stackoverflow.com/questions/40156061/white-space-between-tiles-in-heatplot-ggplot
+# 220621
+posterior_probs_table_long$type = ifelse(posterior_probs_table_long$Measure %in% levels(posterior_probs_table_long$Measure)[1:4], "Distress / Wellbeing", ifelse(posterior_probs_table_long$Measure %in% levels(posterior_probs_table_long$Measure)[5], "Sleep","Cognitive Function"))
+
+posterior_probs_table_long$type <-  posterior_probs_table_long$type %>%  fct_relevel("Distress / Wellbeing","Sleep","Cognitive Function")
+
+
+#- heatmap ggplot with whitespace between related groups of measures
+
+
+# UPDATED BELOW TO COLOUR ONLY HIGH-PROBABILITY CELLS
+
+prob_heatmap <- ggplot(data = posterior_probs_table_long)+
+  facet_grid(~ type, scales='free_x', space="free_x") +
+ geom_tile(color = "white",aes(x=Measure, y=forcats::fct_rev(Contrast),fill=value))+
+geom_text(aes(x=Measure, y=forcats::fct_rev(Contrast),label = round(value, 2)), size=2.5,fontface = ifelse(posterior_probs_table_long$value > 0.9, 2, ifelse(posterior_probs_table_long$value < 0.1,2,1)))+
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0.5, limit = c(0,1), space = "Lab") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+  ylab("Cluster Contrast") + xlab("Measure")
+
+prob_heatmap
+
+# 230621 added fontface to geom_text for selective bolding https://stackoverflow.com/questions/53824860/selective-bold-font-on-graph
+
+
+
+# 010921 UPDATED HEATMAP - COLOUR ONLY CELLS WITH HIGH (>90%) PROB, BOLD CELLS WITH MODERATE (>80%) PROB
+posterior_probs_table_long <- posterior_probs_table_long %>% mutate(bin_label=ifelse(value <= 0.1,"bin1",ifelse(value < 0.9, "bin2",ifelse(value >= 0.9,"bin3",NA))))
+
+prob_heatmap_010921 <- ggplot(data = posterior_probs_table_long)+
+  facet_grid(~ type, scales='free_x', space="free_x") +
+ geom_tile(color = "black",aes(x=Measure, y=forcats::fct_rev(Contrast),fill=bin_label))+
+geom_text(aes(x=Measure, y=forcats::fct_rev(Contrast),label = round(value, 2)), size=2.5,fontface = ifelse(posterior_probs_table_long$value > 0.8, 2, ifelse(posterior_probs_table_long$value < 0.2,2,1)))+
+ scale_fill_manual(values=c("steelblue1","white","tomato1"),
+                        breaks=c("bin1","bin2","bin3"),
+                        labels=c("0.0 - 0.1","0.1 - 0.9","0.9 - 1.0"),
+                        name="Posterior \nProbability")+
+  theme_bw()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+  ylab("Cluster Contrast") + xlab("Measure")
+
+prob_heatmap_010921
+
+
+
+#--------
+# 
+# #alternative heatmaps with clustering/dendrograms
+# posterior_probs_matrix <- as.matrix(posterior_probs_table[,2:10])
+# rownames(posterior_probs_matrix) <- posterior_probs_table$Contrast
+# 
+# heatmap(posterior_probs_matrix)
+# 
+# #install.packages("gplots")
+# library("gplots")
+# heatmap.2(posterior_probs_matrix, scale = "none", col = bluered(100), 
+#           trace = "none", density.info = "none",dendrogram="none")
+# 
+
+
+```
+
+
+
+
+# Estimated Marginal Means - outputs for paper (heatmap + supplementary table)
+
+```{r emmeans_outputs}
+
+
+#----------------------
+
+# FOR PAPER - emmeans - updated with all models family = gaussian 150621
+# Updated to save as variables for subsetting for easier table modification... 210621
+
+#subset like: summary(emmeans_psqi)$contrasts[,2] for estimate column. Summary() saves as subsettable DF. https://stackoverflow.com/questions/48461427/extracting-elements-from-emmgrid-of-emmeans-r-package
+
+emmeans_psqi  <- emmeans(brms_psqi_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_lmn.DET <- emmeans(brms_lmn.DET_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_lmn.IDN <- emmeans(brms_lmn.IDN_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_acc.TWOB <- emmeans(brms_acc.TWOB_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_k10  <- emmeans(brms_k10_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_sphere12  <- emmeans(brms_sphere12_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_sidas  <- emmeans(brms_sidas_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_compasw  <- emmeans(brms_compasw_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+emmeans_lmn.ONB  <- emmeans(brms_lmn.ONB_final,pairwise ~ core_clust) #1v2 & 1v4 CIs exclude zero
+
+
+emmeans_heatmap_table <- data.frame(Contrast = rep(NA,10))
+emmeans_heatmap_table$Contrast <- c("1 > 2", "1 > 3", "1 > 4", "1 > 5", "2 > 3", "2 > 4", "2 > 5", "3 > 4", "3 > 5", "4 > 5")
+emmeans_heatmap_table$K10 <- summary(emmeans_k10)$contrasts[,2]
+emmeans_heatmap_table$`SPHERE-12` <- summary(emmeans_sphere12)$contrasts[,2]
+emmeans_heatmap_table$SIDAS <- summary(emmeans_sidas)$contrasts[,2]
+emmeans_heatmap_table$`COMPAS-W` <- summary(emmeans_compasw)$contrasts[,2]
+emmeans_heatmap_table$PSQI <- summary(emmeans_psqi)$contrasts[,2]
+emmeans_heatmap_table$`DET - RT` <- summary(emmeans_lmn.DET)$contrasts[,2]
+emmeans_heatmap_table$`IDN - RT` <- summary(emmeans_lmn.IDN)$contrasts[,2]
+emmeans_heatmap_table$`OBK - RT` <- summary(emmeans_lmn.ONB)$contrasts[,2]
+emmeans_heatmap_table$`TWOB - Acc` <- summary(emmeans_acc.TWOB)$contrasts[,2]
+
+emmeans_heatmap_table
+
+
+#cast long for ggplot heatmap
+
+emmeans_heatmap_table_long <- emmeans_heatmap_table %>% pivot_longer(cols=-"Contrast",names_to = "Measure")
+
+emmeans_heatmap_table_long$Measure <- factor(emmeans_heatmap_table_long$Measure,levels=c("K10","SPHERE-12","SIDAS","COMPAS-W","PSQI","DET - RT","IDN - RT","OBK - RT","TWOB - Acc"))
+
+emmeans_heatmap_table_long$Contrast <-  factor(emmeans_heatmap_table_long$Contrast) 
+
+# creating type variable for adding white space to delineate conceptually linked measures for heatmap
+# see https://stackoverflow.com/questions/40156061/white-space-between-tiles-in-heatplot-ggplot
+# 220621
+emmeans_heatmap_table_long$type = ifelse(emmeans_heatmap_table_long$Measure %in% levels(emmeans_heatmap_table_long$Measure)[1:4], "Distress / Wellbeing", ifelse(emmeans_heatmap_table_long$Measure %in% levels(emmeans_heatmap_table_long$Measure)[5], "Sleep","Cognitive Function"))
+
+emmeans_heatmap_table_long$type <-  emmeans_heatmap_table_long$type %>%  fct_relevel("Distress / Wellbeing","Sleep","Cognitive Function")
+
+
+
+#---------------------------------------------
+
+
+# SCALE from -1 to 1 for heatmap colours since each variable is on a diff scale
+
+emmeans_heatmap_table_scaled <- emmeans_heatmap_table
+
+for(i in 2:10){
+  emmeans_heatmap_table_scaled[,i] <- scales::rescale(emmeans_heatmap_table[,i],to=c(-1,1))
+}
+
+
+#cast long for ggplot heatmap
+
+emmeans_heatmap_table_scaled_long <- emmeans_heatmap_table_scaled %>% pivot_longer(cols=-"Contrast",names_to = "Measure")
+
+emmeans_heatmap_table_scaled_long$Measure <- factor(emmeans_heatmap_table_scaled_long$Measure,levels=c("K10","SPHERE-12","SIDAS","COMPAS-W","PSQI","DET - RT","IDN - RT","OBK - RT","TWOB - Acc"))
+
+emmeans_heatmap_table_scaled_long$Contrast <-  factor(emmeans_heatmap_table_scaled_long$Contrast) 
+
+# creating type variable for adding white space to delineate conceptually linked measures for heatmap
+# see https://stackoverflow.com/questions/40156061/white-space-between-tiles-in-heatplot-ggplot
+# 220621
+emmeans_heatmap_table_scaled_long$type = ifelse(emmeans_heatmap_table_scaled_long$Measure %in% levels(emmeans_heatmap_table_scaled_long$Measure)[1:4], "Distress / Wellbeing", ifelse(emmeans_heatmap_table_scaled_long$Measure %in% levels(emmeans_heatmap_table_scaled_long$Measure)[5], "Sleep","Cognitive Function"))
+
+emmeans_heatmap_table_scaled_long$type <-  emmeans_heatmap_table_scaled_long$type %>%  fct_relevel("Distress / Wellbeing","Sleep","Cognitive Function")
+
+
+#------------------------
+
+
+
+
+
+
+
+
+#-------------------------
+
+# Kind of a shamozzle... colour scales being weird. Hard to interpret... Inclined to just include the TABLE
+
+emmeans_heatmap <- ggplot(data=emmeans_heatmap_table_scaled_long)+
+  facet_grid(~ type, scales='free_x', space="free_x") +
+ geom_tile(color = "white",aes(x=Measure, y=forcats::fct_rev(Contrast),fill=value))+
+geom_text(aes(x=emmeans_heatmap_table_long$Measure, y=forcats::fct_rev(emmeans_heatmap_table_long$Contrast),label = round(emmeans_heatmap_table_long$value, 2)), size=2.5)+ #fontface = ifelse(emmeans_heatmap_table_long$value > 0.9, 2, ifelse(emmeans_heatmap_table_long$value < 0.1,2,1))
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Size of Contrast \n(Expectated Marginal Mean)") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+  ylab("Cluster Contrast") + xlab("Measure")
+
+emmeans_heatmap
+
+
+
+
+#--------------------------
+
+
+# Full supplementary table - emmeans and credible intervals
+
+# paste(round(summary(emmeans_k10)$contrasts[,2],2)," (",round(summary(emmeans_k10)$contrasts[,3],2),", ",round(summary(emmeans_k10)$contrasts[,4],2),")",sep="")
+
+
+
+emmeans_supplementary_table <- data.frame(Contrast = rep(NA,10))
+emmeans_supplementary_table$Contrast <- c("1 > 2", "1 > 3", "1 > 4", "1 > 5", "2 > 3", "2 > 4", "2 > 5", "3 > 4", "3 > 5", "4 > 5")
+emmeans_supplementary_table$K10 <- paste(round(summary(emmeans_k10)$contrasts[,2],2)," (",round(summary(emmeans_k10)$contrasts[,3],2),", ",round(summary(emmeans_k10)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$`SPHERE-12` <- paste(round(summary(emmeans_sphere12)$contrasts[,2],2)," (",round(summary(emmeans_sphere12)$contrasts[,3],2),", ",round(summary(emmeans_sphere12)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$SIDAS <- paste(round(summary(emmeans_sidas)$contrasts[,2],2)," (",round(summary(emmeans_sidas)$contrasts[,3],2),", ",round(summary(emmeans_sidas)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$`COMPAS-W` <- paste(round(summary(emmeans_compasw)$contrasts[,2],2)," (",round(summary(emmeans_compasw)$contrasts[,3],2),", ",round(summary(emmeans_compasw)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$PSQI <- paste(round(summary(emmeans_psqi)$contrasts[,2],2)," (",round(summary(emmeans_psqi)$contrasts[,3],2),", ",round(summary(emmeans_psqi)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$`DET - RT` <- paste(round(summary(emmeans_lmn.DET)$contrasts[,2],2)," (",round(summary(emmeans_lmn.DET)$contrasts[,3],2),", ",round(summary(emmeans_lmn.DET)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$`IDN - RT` <- paste(round(summary(emmeans_lmn.IDN)$contrasts[,2],2)," (",round(summary(emmeans_lmn.IDN)$contrasts[,3],2),", ",round(summary(emmeans_lmn.IDN)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$`OBK - RT` <- paste(round(summary(emmeans_lmn.ONB)$contrasts[,2],2)," (",round(summary(emmeans_lmn.ONB)$contrasts[,3],2),", ",round(summary(emmeans_lmn.ONB)$contrasts[,4],2),")",sep="")
+emmeans_supplementary_table$`TWOB - Acc` <- paste(round(summary(emmeans_acc.TWOB)$contrasts[,2],2)," (",round(summary(emmeans_acc.TWOB)$contrasts[,3],2),", ",round(summary(emmeans_acc.TWOB)$contrasts[,4],2),")",sep="")
+
+
+
+
+print(xtable(emmeans_supplementary_table,digits=2),floating=FALSE,latex.environments=NULL,booktabs=TRUE,include.rownames=FALSE)
+
+
+# EXCLUDE ROWNAMES FOR XTABLE: include.rownames=FALSE
+# https://stackoverflow.com/questions/5430338/remove-data-frame-row-names-when-using-xtable
+
+```
+
+
+
+
+
+
+
+
+
+
+
+#250821
+
+Fingerprint barplots - diverging barcharts for EEG and health features by each cluster
+
+
+1. calculate z-scores and standard deviations
+
+
+plot
+geom_col
+
+```{r}
+head(t1_anova_df_grouped_clust_noX)
+
+cluster_eeg_features_df <- cz_ff_store_orig %>% as_tibble() %>% mutate(core_clust = core_cluster_colours) %>% group_by(core_clust)
+
+head(cluster_eeg_features_df)
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+# 1. calculate Z-scores
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+# indices of 8 EEG features in cluster_eeg_features_df$
+eeg_feature_indices <- c(1,2,3,4,5,6,7,8)
+
+# indices of 8 EEG features in t1_anova_df_grouped_clust_noX$
+health_measure_indices <- c(1,2,3,4,5,6,7,8,9)
+
+z_fn <- function(df,var_indices){
+  
+  for (i in var_indices){
+  
+  z_temp  <- scale(df[,i])
+  
+  df <- cbind(df,z_temp[,1])
+  
+  # might want to add z-score SD calculation in here?
+  
+  names(df)[length(names(df))] <- paste(names(df)[var_indices[i]],"_z_score",sep="")
+  }
+  
+  return(df)
+}
+
+# Might want to add SD in future for error bars on column plots - leaving it out for now as how to calculate it / pivot longer etc is doing my head in
+#250821
+
+
+# Remove X unassigned from the df
+
+cluster_eeg_features_df <- cluster_eeg_features_df[cluster_eeg_features_df$core_clust!="X",]
+
+
+
+eeg_z_score_df <-  z_fn(df = cluster_eeg_features_df,var_indices = eeg_feature_indices)
+
+# Group data frame and find mean and SD for z-score for each cluster
+eeg_z_score_df <- eeg_z_score_df %>% group_by(core_clust) %>% mutate(across(.cols=c(9:16),.fns=list(mean= ~ mean(.x,na.rm=T),sd=~ sd(.x,na.rm=T))))
+  #mutate(z_mean = mean(z_score), z_sd = sd(z_score))
+
+# Select core_clust, z_mean and z_sd cols, pivot longer 
+eeg_z_pivot <- eeg_z_score_df[,c(9,18:33)] %>% pivot_longer(cols = ends_with("_mean"),names_to = "eeg_feature_mean",values_to = "z_mean")
+eeg_z_pivot <- eeg_z_pivot %>% pivot_longer(cols = ends_with("_sd"),names_to = "eeg_feature_sd",values_to = "z_sd")
+
+
+# trim to distinct rows for initial trimming
+eeg_z_thinned <- eeg_z_pivot %>% distinct(.keep_all = T)
+
+
+eeg_z_thinned <- eeg_z_thinned %>% mutate(mean_cut = substr(eeg_feature_mean,1,nchar(eeg_feature_mean)-5),sd_cut = substr(eeg_feature_sd,1,nchar(eeg_feature_sd)-3)) %>% filter(mean_cut == sd_cut)
+
+
+# Names column for plot legend/colours - ordered factor
+
+eeg_z_thinned$eeg_features <- rep(NA, length(eeg_z_thinned[ ,1]))
+
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_peak_f_z_score_mean"] <- "IAF"
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_sef_95_z_score_mean"] <- "SEF95"
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_tot_pow_z_score_mean"] <- "Total Power"
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_pow_0_4_z_score_mean"] <- "Delta (0-4 Hz)"
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_pow_4_8_z_score_mean"] <- "Theta (4-8 Hz)"
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_pow_8_12_z_score_mean"] <- "Alpha (8-12 Hz)"
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_pow_12_16_z_score_mean"] <- "Low Beta (12-16 Hz)" 
+eeg_z_thinned$eeg_features[eeg_z_thinned$eeg_feature_mean=="Cz_spectral_entropy_z_score_mean"] <- "Spectral Entropy"
+
+
+eeg_z_thinned$eeg_features <- factor(eeg_z_thinned$eeg_features,levels=c("IAF","SEF95","Total Power","Spectral Entropy","Delta (0-4 Hz)","Theta (4-8 Hz)","Alpha (8-12 Hz)", "Low Beta (12-16 Hz)"))
+
+  
+#----------------------------------------------------------------------------------------------
+
+
+
+health_z_score_df <- z_fn(df = t1_anova_df_grouped_clust_noX,var_indices = health_measure_indices)
+
+
+# Group data frame and find mean and SD for z-score for each cluster
+health_z_score_df <- health_z_score_df %>% group_by(core_clust) %>% mutate(across(.cols=c(24:32),.fns=list(mean= ~ mean(.x,na.rm=T),sd=~ sd(.x,na.rm=T))))
+  #mutate(z_mean = mean(z_score), z_sd = sd(z_score))
+
+
+# Select core_clust, z_mean and z_sd cols, pivot longer 
+health_z_pivot <- health_z_score_df[,c(18,34:51)] %>% pivot_longer(cols = ends_with("_mean"),names_to = "health_feature_mean",values_to = "z_mean")
+health_z_pivot <- health_z_pivot %>% pivot_longer(cols = ends_with("_sd"),names_to = "health_feature_sd",values_to = "z_sd")
+
+# trim to distinct rows for initial trimming
+health_z_thinned <- health_z_pivot %>% distinct(.keep_all = T)
+
+
+health_z_thinned <- health_z_thinned %>% mutate(mean_cut = substr(health_feature_mean,1,nchar(health_feature_mean)-5),sd_cut = substr(health_feature_sd,1,nchar(health_feature_sd)-3)) %>% filter(mean_cut == sd_cut)
+
+
+# Names column for plot legend/colours - ordered factor
+
+health_z_thinned$health_measures <- c(rep("blah",length(health_z_thinned$core_clust)))
+
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="k10_score_z_score_mean"] <- "K10"
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="sphere12_total_z_score_mean"] <- "SPHERE-12"
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="sidas_score_z_score_mean"] <- "SIDAS"
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="compas_w_wellbeing_z_score_mean"] <- "COMPAS-W"
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="psqi_PSQI_SCORE_z_score_mean"] <- "PSQI"
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="cogstate_lmn.DET_z_score_mean"] <- "DET - RT"
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="cogstate_lmn.IDN_z_score_mean"] <- "IDN - RT"
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="cogstate_lmn.ONB_z_score_mean"] <- "OBK - RT" 
+health_z_thinned$health_measures[health_z_thinned$health_feature_mean=="cogstate_acc.TWOB_z_score_mean"] <- "TWOB - Acc"
+
+
+health_z_thinned$health_measures <- factor(health_z_thinned$health_measures,levels=c("K10","SPHERE-12","SIDAS","COMPAS-W","PSQI","DET - RT","IDN - RT", "OBK - RT","TWOB - Acc"))
+
+  
+
+#--------------------------------------------------------------------
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+# 2. create ggplots
+# geom_col
+# geom_errorbar
+# facet_grid
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+
+eeg_fingerprint_plots <- ggplot(eeg_z_thinned, aes(x=eeg_features, y=z_mean, group=eeg_features)) + 
+  geom_col(aes(fill=eeg_features))+
+  scale_fill_brewer(palette="Set2") +
+  guides(fill=guide_legend(title="EEG Features"))+  
+  geom_errorbar(aes(ymin=z_mean-z_sd, ymax=z_mean+z_sd),   width=.005,position=position_dodge(.9),alpha=0.3) +
+  facet_grid(. ~ core_clust)+
+  theme_bw()+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + 
+  theme(panel.spacing = unit(2, "lines"))+
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+  xlab("Core Clusters")+
+  ylab("Z-Scores")+ theme(text = element_text(size = 15))
+  
+eeg_fingerprint_plots
+
+#--------------------------------------------------------------------
+
+
+
+
+health_fingerprint_plots <- ggplot(health_z_thinned, aes(x=health_measures, y=z_mean, group=health_measures)) + 
+  geom_col(aes(fill=health_measures))+
+  scale_fill_manual(values=c(RColorBrewer::brewer.pal(5,"Reds")[2:5],RColorBrewer::brewer.pal(3,"Greens")[2],RColorBrewer::brewer.pal(5,"Blues")[2:5])) +
+  guides(fill=guide_legend(title="Health Measures"))+
+  geom_errorbar(aes(ymin=z_mean-z_sd, ymax=z_mean+z_sd), width=.005,position=position_dodge(.9),alpha=0.2) +
+  facet_grid(. ~ core_clust)+
+  theme_bw()+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + 
+  theme(panel.spacing = unit(2, "lines"))+
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+  xlab("Core Clusters")+
+  ylab("Z-Scores") + theme(text = element_text(size = 15))
+  
+health_fingerprint_plots
+
+
+
+png("fingerprint_plots.png",width=1000,height=1000,pointsize=14)
+  grid.arrange(eeg_fingerprint_plots,health_fingerprint_plots)
+dev.off()
+
+```
+
