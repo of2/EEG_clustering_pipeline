@@ -169,7 +169,9 @@ freq_feats_df <- data.frame('channels'=c(1:32),'chan_name'=chan_names,'peak_f'=N
 for (i in 1:32){
 freq_feats_df$peak_f[i] <- mt_spec$f[14+(which.max(mt_mean_over_time[i,15:29]))] # NOT DECIBEL FOR THIS #updated to look in range 7-14Hz for IAF (15:29 frequency index)
 
-freq_feats_df$sef_95[i] <- mt_spec$f[match(TRUE,(cumsum((mt_mean_over_time[i,]))/sum((mt_mean_over_time[i,])) > 0.95))] freq_feats_df$tot_pow[i] <- sum((mt_mean_over_time[i,])) 
+freq_feats_df$sef_95[i] <- mt_spec$f[match(TRUE,(cumsum((mt_mean_over_time[i,]))/sum((mt_mean_over_time[i,])) > 0.95))] 
+
+freq_feats_df$tot_pow[i] <- sum((mt_mean_over_time[i,])) 
 
 #! do below with raw frequency (not decibel)
 freq_feats_df$pow_0_4[i] <- sum(mt_mean_over_time[i,1:8])/sum(mt_mean_over_time[i,]) 
